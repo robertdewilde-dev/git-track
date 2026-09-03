@@ -53,8 +53,8 @@ func exitErr(code int, format string, a ...any) error {
 }
 
 var rootCmd = &cobra.Command{
-	Use:           "git-track",
-	Short:         "Branch-scoped issue metadata stored in git refs",
+	Use:   "git-track",
+	Short: "Branch-scoped issue metadata stored in git refs",
 	Long: `git-track stores per-branch issue metadata as commit objects under
 refs/meta/branches/*. It syncs via normal git push/fetch and needs no forge or
 external service. Every read command supports --json (machine output on

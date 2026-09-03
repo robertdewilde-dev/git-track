@@ -92,7 +92,7 @@ If multi-writer convergence ever becomes a requirement, git-bug's
   "state": "in-progress",
   "context": "Extracted token validation into its own package",
   "next": ["write tests", "update docs"],
-  "tags": ["backend", "security"],
+  "labels": ["backend", "security"],
   "links": ["https://forgejo.local/me/proj/issues/42"],
   "agent": {
     "lastRun": "2026-09-03T10:22:00Z",
@@ -115,7 +115,7 @@ Field rules:
 | `issue` | integer | Optional. |
 | `title`, `context` | string | Optional. |
 | `state` | string | Optional. Validated against `git config track.states` (comma/space separated); default set: `todo`, `in-progress`, `blocked`, `review`, `done`. |
-| `next`, `tags`, `links` | array of strings | Optional. |
+| `next`, `labels`, `links` | array of strings | Optional. `labels` uses the shared vocabulary (see "Channels and labels"). |
 | `agent` | object | Optional. Freeform, plus the lock fields below. |
 | `agent.lockedBy` | string or null | `<user>@<machine>:<pid>` while locked. |
 | `agent.lockedAt` | string | RFC 3339 time the lock was acquired. |
@@ -158,6 +158,70 @@ Never drop data written by a newer version.
 
 The push is the mutex: only one writer's lease against `P` can succeed.
 
+## Channels and labels
+
+Channels are async message streams for agents (and humans) to leave findings,
+decisions, and progress notes — a timeline, not a document. Each channel lives
+at:
+
+```
+refs/meta/channels/<name>
+```
+
+(the prefix follows `track.namespace`: its parent plus `/channels`). **One
+commit per message**: the commit message is the message. `git log
+refs/meta/channels/android` literally is the chat log. Message commits have an
+empty tree and are formatted as a body, a blank line, then git trailers:
+
+```
+Emulator is flaky on API 35; pinning to API 34 for now.
+
+Label: bug
+Label: android
+By: robert@robert-desktop
+```
+
+`Label:` may repeat; `By:` identifies the actor (the git author is a
+fallback). Every branch implicitly has a channel named after it; named
+channels (`android`, `planning`) span branches. `git track say` posts,
+`git track chat` reads, and reading is **pull-based**: poll with
+`git track fetch`.
+
+Posting appends a commit to the channel ref (CAS on the old tip) and pushes
+immediately with `--force-with-lease`. On rejection the poster fetches the
+remote tip and **replays its local-only message commits on top of it** —
+concurrent posts merge instead of conflicting; a message, once committed, is
+never lost. If the remote is unreachable the message stays local and merges on
+the next `say` or `git track push --all`.
+
+Label and channel **definitions** — a shared, optional vocabulary, each name
+mapped to a one-line description — live in a single document `defs.json` on:
+
+```
+refs/meta/defs/all
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "labels":   { "bug": { "description": "Something is broken for users" } },
+  "channels": { "planning": { "description": "Cross-branch planning notes" } }
+}
+```
+
+The same labels classify branch documents (the `labels` field) and messages
+(`Label:` trailers). Definitions are documentation, not enforcement: undefined
+labels and channels work; the CLI prints a stderr hint when a label is used
+that has no definition while a vocabulary exists.
+
+**Sync path:** channel and defs refs are deliberately *not* added to the
+configured refspecs. A channel ref with unsent local messages is not
+fast-forwardable, and a configured non-forced refspec would make plain
+`git fetch` exit non-zero — so these refs sync only through the tool:
+`say` (auto-push), `git track push --all`, and `git track fetch` (which
+fast-forwards channels, force-updates defs, and reports channels holding
+unsent local messages instead of clobbering them).
+
 ## MCP server
 
 `git track mcp` speaks the Model Context Protocol over stdio (JSON-RPC 2.0,
@@ -165,9 +229,11 @@ one message per line, protocol version `2024-11-05`). Register it in an agent
 client as command `git-track`, args `["mcp"]`, run from inside the repository.
 
 Tools: `get_branch_context`, `get_context_markdown`, `list_branches`,
-`set_field`, `unset_field`, `acquire_lock`, `release_lock`. All accept an
-optional `branch` argument, defaulting to the checked-out branch. Errors come
-back as tool results with `isError: true` and include the CLI exit code.
+`set_field`, `unset_field`, `acquire_lock`, `release_lock`, `say`,
+`read_chat`, `list_channels`, `list_labels`, `define_label`,
+`define_channel`. Branch-scoped tools accept an optional `branch` argument,
+defaulting to the checked-out branch. Errors come back as tool results with
+`isError: true` and include the CLI exit code.
 
 ## Sync configuration
 
@@ -216,7 +282,9 @@ Hooks installed (respecting `core.hooksPath`; a pre-existing hook is renamed to
   `git track prune` cleans them up.
 - **Object growth:** every write creates a commit+tree+blob. Chatty agents
   should batch writes, and `git track squash` collapses a branch's metadata
-  history to a single commit.
+  history to a single commit. Channel messages are one commit each by design
+  (the history *is* the data); message commits share the empty tree, so growth
+  is one small object per message.
 - **No trust model:** anyone with push access can rewrite metadata history.
   Sign metadata commits if that matters; out of scope here.
 

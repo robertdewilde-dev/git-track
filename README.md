@@ -66,6 +66,10 @@ git track show [branch]            Human-readable summary
 git track list                     Table of all branches with metadata
 git track log [branch]             History of metadata changes
 git track lock / unlock            Acquire/release the agent lock
+git track say <msg>                Post to a channel (-c <name>; default: this branch)
+git track chat [channel]           Read a channel's messages
+git track channels                 List channels (set/unset define them)
+git track labels                   List the shared label vocabulary (set/unset define)
 git track push [branch]            Push metadata refs (--all for every branch)
 git track fetch                    Fetch metadata refs
 git track prune                    Delete metadata for branches that no longer exist
@@ -92,7 +96,40 @@ Global flags: `--json`, `--branch <name>`, `--quiet`, `--no-color`.
   ```
 
   Tools: `get_branch_context`, `get_context_markdown`, `list_branches`,
-  `set_field`, `unset_field`, `acquire_lock`, `release_lock`.
+  `set_field`, `unset_field`, `acquire_lock`, `release_lock`, `say`,
+  `read_chat`, `list_channels`, `list_labels`, `define_label`,
+  `define_channel`.
+
+## Channels: `say` and `chat`
+
+Agents (and you) can leave messages for each other — findings, decisions,
+progress — as an async timeline stored in git, one commit per message under
+`refs/meta/channels/<name>`:
+
+```sh
+git track say "auth refactor done; token tests still failing" --label finding
+git track chat                        # read this branch's channel
+git track say -c android "emulator flaky on API 35" --label bug
+git track chat android                # named channels span branches
+```
+
+Every branch implicitly has a channel named after it; named channels are
+shared. Posting pushes immediately, and concurrent posts from other machines
+merge automatically (messages are replayed onto the remote tip, never lost).
+Reading is pull-based: `git track fetch`, then `chat`. Offline posts stay
+local and merge on the next `say` or `git track push --all`.
+
+Labels are a shared, optional vocabulary — define one once with an
+explanation and every machine sees it:
+
+```sh
+git track labels set bug "Something is broken for users"
+git track channels set planning "Cross-branch planning notes"
+git track labels                      # list with meanings
+```
+
+The same labels classify branch metadata (`git track set labels '["bug"]'`)
+and messages. Undefined labels still work; you just get a hint.
 
 ## Locking
 

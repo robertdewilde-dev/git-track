@@ -637,3 +637,160 @@ func newLineScanner(r io.Reader) *bufio.Scanner {
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	return sc
 }
+
+// --- Channels & labels ---
+
+func TestSayChatRoundTrip(t *testing.T) {
+	remote, a := setup(t)
+	mustTrack(t, a, "say", "starting on the auth refactor")
+	mustTrack(t, a, "say", "token validation moved to its own package", "--label", "decision")
+
+	// Another clone polls and reads.
+	b := cloneOf(t, remote, "clone-b")
+	mustTrack(t, b, "fetch")
+	out := mustTrack(t, b, "chat", "--json")
+	var res struct {
+		Channel  string `json:"channel"`
+		Messages []struct {
+			By     string   `json:"by"`
+			Labels []string `json:"labels"`
+			Body   string   `json:"body"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("chat --json invalid: %v\n%s", err, out)
+	}
+	if res.Channel != "main" || len(res.Messages) != 2 {
+		t.Fatalf("expected 2 messages on #main, got %+v", res)
+	}
+	// Newest first.
+	if res.Messages[0].Body != "token validation moved to its own package" {
+		t.Fatalf("unexpected newest message: %+v", res.Messages[0])
+	}
+	if len(res.Messages[0].Labels) != 1 || res.Messages[0].Labels[0] != "decision" {
+		t.Fatalf("labels lost: %+v", res.Messages[0])
+	}
+	if res.Messages[0].By == "" {
+		t.Fatalf("by missing: %+v", res.Messages[0])
+	}
+}
+
+func TestSayNamedChannelAcrossBranches(t *testing.T) {
+	remote, a := setup(t)
+	mustTrack(t, a, "say", "-c", "android", "emulator flaky on API 35")
+
+	b := cloneOf(t, remote, "clone-b")
+	git(t, b, "checkout", "-b", "other-branch")
+	mustTrack(t, b, "fetch")
+	out := mustTrack(t, b, "chat", "android")
+	if !strings.Contains(out, "emulator flaky") {
+		t.Fatalf("named channel not shared across branches:\n%s", out)
+	}
+
+	// The branch channel is empty: exit 2.
+	_, _, code := track(t, b, "chat")
+	if code != 2 {
+		t.Fatalf("empty channel: expected exit 2, got %d", code)
+	}
+}
+
+func TestSayConcurrentPostsMerge(t *testing.T) {
+	remote, a := setup(t)
+	b := cloneOf(t, remote, "clone-b")
+	git(t, b, "checkout", "main")
+
+	// Both clones post to the same channel; b posts without having fetched
+	// a's message, so its push must replay onto the remote tip.
+	mustTrack(t, a, "say", "-c", "planning", "message from a")
+	mustTrack(t, b, "say", "-c", "planning", "message from b")
+
+	mustTrack(t, a, "fetch")
+	out := mustTrack(t, a, "chat", "planning")
+	if !strings.Contains(out, "message from a") || !strings.Contains(out, "message from b") {
+		t.Fatalf("concurrent posts did not merge:\n%s", out)
+	}
+}
+
+func TestSayOfflineThenPushMerges(t *testing.T) {
+	remote, a := setup(t)
+	b := cloneOf(t, remote, "clone-b")
+	git(t, b, "checkout", "main")
+	mustTrack(t, b, "say", "-c", "planning", "remote message")
+
+	// Simulate a offline: the local commit succeeds, the sync fails.
+	git(t, a, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git"))
+	_, stderr, code := track(t, a, "say", "-c", "planning", "offline message")
+	if code != 0 {
+		t.Fatalf("offline say should still succeed locally: %s", stderr)
+	}
+	if !strings.Contains(stderr, "saved locally") {
+		t.Fatalf("expected local-save notice, got: %s", stderr)
+	}
+
+	// Back online: fetch reports the channel as behind, push --all merges.
+	git(t, a, "remote", "set-url", "origin", remote)
+	_, stderr, _ = track(t, a, "fetch")
+	if !strings.Contains(stderr, "unsent local messages") {
+		t.Fatalf("fetch should report unsent messages, got: %s", stderr)
+	}
+	mustTrack(t, a, "push", "--all")
+	mustTrack(t, a, "fetch")
+	out := mustTrack(t, a, "chat", "planning")
+	if !strings.Contains(out, "offline message") || !strings.Contains(out, "remote message") {
+		t.Fatalf("offline message did not merge:\n%s", out)
+	}
+	// And the other clone sees both.
+	mustTrack(t, b, "fetch")
+	out = mustTrack(t, b, "chat", "planning")
+	if !strings.Contains(out, "offline message") {
+		t.Fatalf("merged message not visible remotely:\n%s", out)
+	}
+}
+
+func TestLabelDefinitionsSharedAndHinted(t *testing.T) {
+	remote, a := setup(t)
+	mustTrack(t, a, "labels", "set", "bug", "Something is broken for users")
+	mustTrack(t, a, "channels", "set", "planning", "Cross-branch planning notes")
+
+	// Defined label: no hint. Undefined label: hint on stderr, still works.
+	_, stderr, code := track(t, a, "say", "found it", "--label", "bug")
+	if code != 0 || strings.Contains(stderr, "hint") {
+		t.Fatalf("defined label should not hint (code %d): %s", code, stderr)
+	}
+	_, stderr, code = track(t, a, "say", "odd behavior", "--label", "androd")
+	if code != 0 {
+		t.Fatalf("undefined label must still work: %s", stderr)
+	}
+	if !strings.Contains(stderr, "not defined") {
+		t.Fatalf("expected undefined-label hint, got: %s", stderr)
+	}
+
+	// Definitions sync to other clones.
+	b := cloneOf(t, remote, "clone-b")
+	mustTrack(t, b, "fetch")
+	out := mustTrack(t, b, "labels")
+	if !strings.Contains(out, "bug") || !strings.Contains(out, "Something is broken") {
+		t.Fatalf("label definitions did not sync:\n%s", out)
+	}
+	out = mustTrack(t, b, "channels")
+	if !strings.Contains(out, "planning") || !strings.Contains(out, "Cross-branch planning") {
+		t.Fatalf("channel definitions did not sync:\n%s", out)
+	}
+
+	// Labels field on the branch doc validates as string array.
+	mustTrack(t, a, "set", "labels", `["bug","backend"]`)
+	out = mustTrack(t, a, "show")
+	if !strings.Contains(out, "labels:") || !strings.Contains(out, "bug, backend") {
+		t.Fatalf("labels field missing from show:\n%s", out)
+	}
+}
+
+func TestContextIncludesChat(t *testing.T) {
+	_, a := setup(t)
+	mustTrack(t, a, "set", "title", "Auth refactor")
+	mustTrack(t, a, "say", "left off at the token tests")
+	out := mustTrack(t, a, "context")
+	if !strings.Contains(out, "Recent chat") || !strings.Contains(out, "left off at the token tests") {
+		t.Fatalf("context missing chat:\n%s", out)
+	}
+}

@@ -14,7 +14,12 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 - Before changes another agent might race on: `git track lock --ttl 30m`;
   exit `3` means someone else holds it. `git track unlock` when done.
 - Exit `5` on any push means fetch first: `git track fetch`, then retry.
-- Prompt-ready summary: `git track context` (markdown).
+- Leave notes for other agents: `git track say "finding..." --label bug`
+  posts to this branch's channel (`-c <name>` for a cross-branch channel);
+  `git track fetch` + `git track chat` reads. Concurrent posts merge
+  automatically. Define labels/channels once with
+  `git track labels set <name> "<meaning>"` / `channels set`.
+- Prompt-ready summary: `git track context` (markdown, includes recent chat).
 - Preferred for MCP-capable agents: `git track mcp` runs a stdio MCP server
   (tools: get_branch_context, set_field, acquire_lock, ...).
 - Full integration contract (ref layout, schema, exit codes, plain-git access):
@@ -27,7 +32,7 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 | `main.go` | Entry point; exits with `cmd.Execute()`'s code. |
 | `cmd/` | Cobra subcommands, one file each. `root.go` has exit codes, global flags, the shared `mutateDoc` write path. `mcp.go` is the MCP stdio server. |
 | `internal/gitcmd/` | The only place git is invoked. Swappable transport. |
-| `internal/store/` | Read/write metadata commits to refs; push/fetch with force-with-lease. No CLI or output concerns. |
+| `internal/store/` | Read/write metadata commits to refs; push/fetch with force-with-lease. `channels.go`: message streams (one commit per message) + shared label/channel definitions. No CLI or output concerns. |
 | `internal/schema/` | Versioned document, validation, dot paths, unknown-field passthrough. |
 | `internal/lock/` | Lock identity (`user@machine:pid`), TTL expiry, actor comparison. |
 | `internal/hooks/` | post-checkout / pre-push install with chaining. |

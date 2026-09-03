@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/robertdewilde-dev/git-track/internal/schema"
+	"github.com/robertdewilde-dev/git-track/internal/store"
 	"github.com/spf13/cobra"
 )
 
@@ -34,7 +35,8 @@ var contextCmd = &cobra.Command{
 		if err != nil {
 			return jsonError(err)
 		}
-		md := contextMarkdown(branch, doc)
+		msgs, _ := c.store.Messages(branch, 5)
+		md := contextMarkdown(branch, doc, msgs)
 		if flagJSON {
 			return printJSON(map[string]any{"branch": branch, "markdown": md})
 		}
@@ -43,9 +45,10 @@ var contextCmd = &cobra.Command{
 	},
 }
 
-// contextMarkdown renders a prompt-ready markdown block. Shared with the MCP
+// contextMarkdown renders a prompt-ready markdown block, including the most
+// recent chat messages from the branch's channel. Shared with the MCP
 // server's get_context_markdown tool.
-func contextMarkdown(branch string, doc schema.Doc) string {
+func contextMarkdown(branch string, doc schema.Doc, msgs []store.Message) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## Branch context: %s\n\n", branch)
 	if n, ok := doc["issue"].(float64); ok {
@@ -69,8 +72,8 @@ func contextMarkdown(branch string, doc schema.Doc) string {
 			fmt.Fprintf(&b, "  - %s\n", n)
 		}
 	}
-	if tags := stringList(doc["tags"]); len(tags) > 0 {
-		fmt.Fprintf(&b, "- **Tags:** %s\n", strings.Join(tags, ", "))
+	if labels := stringList(doc["labels"]); len(labels) > 0 {
+		fmt.Fprintf(&b, "- **Labels:** %s\n", strings.Join(labels, ", "))
 	}
 	if links := stringList(doc["links"]); len(links) > 0 {
 		fmt.Fprintf(&b, "- **Links:** %s\n", strings.Join(links, " "))
@@ -78,6 +81,17 @@ func contextMarkdown(branch string, doc schema.Doc) string {
 	if notes, ok := doc.Get("agent.notes"); ok {
 		if s, ok := notes.(string); ok && s != "" {
 			fmt.Fprintf(&b, "- **Agent notes:** %s\n", s)
+		}
+	}
+	if len(msgs) > 0 {
+		fmt.Fprintf(&b, "- **Recent chat** (`git track chat`):\n")
+		for i := len(msgs) - 1; i >= 0; i-- { // oldest first
+			m := msgs[i]
+			labels := ""
+			if len(m.Labels) > 0 {
+				labels = " [" + strings.Join(m.Labels, ", ") + "]"
+			}
+			fmt.Fprintf(&b, "  - %s%s: %s\n", m.By, labels, strings.ReplaceAll(m.Body, "\n", " "))
 		}
 	}
 	updatedAt, _ := doc["updatedAt"].(string)

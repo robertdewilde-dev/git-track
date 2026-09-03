@@ -33,8 +33,15 @@ func (s *Store) RemoteSHA(remote, ref string) (string, error) {
 // remote history is never discarded. A non-fast-forward situation returns
 // *ConflictError.
 func (s *Store) Push(remote, branch string) (PushResult, error) {
-	ref := s.Ref(branch)
-	res := PushResult{Branch: branch, Ref: ref}
+	res, err := s.PushRef(remote, s.Ref(branch))
+	res.Branch = branch
+	return res, err
+}
+
+// PushRef is Push for an arbitrary ref (used for the defs ref too): same
+// lease-based CAS semantics, no branch mapping.
+func (s *Store) PushRef(remote, ref string) (PushResult, error) {
+	res := PushResult{Ref: ref}
 	local, err := s.Git.Run("rev-parse", "--verify", "--quiet", ref)
 	if err != nil || local == "" {
 		return res, ErrNoMetadata
@@ -80,6 +87,18 @@ func (s *Store) Fetch(remote string) error {
 	_, err := s.Git.Run("fetch", "--quiet", remote, spec)
 	if err != nil {
 		return fmt.Errorf("fetching metadata refs: %w", err)
+	}
+	return nil
+}
+
+// FetchDefs mirrors the remote defs namespace locally (forced; safe because
+// every defs write is pushed immediately). Missing refs are not an error.
+func (s *Store) FetchDefs(remote string) error {
+	parent := s.metaParent()
+	spec := fmt.Sprintf("+%s/defs/*:%s/defs/*", parent, parent)
+	_, err := s.Git.Run("fetch", "--quiet", remote, spec)
+	if err != nil {
+		return fmt.Errorf("fetching definitions: %w", err)
 	}
 	return nil
 }

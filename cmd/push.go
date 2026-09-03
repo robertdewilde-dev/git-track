@@ -52,6 +52,23 @@ var pushCmd = &cobra.Command{
 				info("%s: %s", b, res.Status)
 			}
 		}
+		if all {
+			// --all also syncs the channels and shared definitions (they are
+			// not in the configured refspecs; the tool is their sync path).
+			channels, _ := c.store.Channels()
+			for _, ch := range channels {
+				if err := c.store.SyncChannel(remote, ch); err != nil {
+					info("channel %s: sync failed (%s)", ch, err)
+				}
+			}
+			if _, _, err := c.store.ReadDefs(); err == nil {
+				if res, err := c.store.PushRef(remote, c.store.DefsRef()); err != nil {
+					info("definitions: sync failed (%s)", err)
+				} else if res.Status != "up-to-date" {
+					info("definitions: %s", res.Status)
+				}
+			}
+		}
 		if flagJSON {
 			if results == nil {
 				results = []store.PushResult{}
@@ -78,8 +95,18 @@ var fetchCmd = &cobra.Command{
 		if err := c.store.Fetch(remote); err != nil {
 			return err
 		}
+		if err := c.store.FetchDefs(remote); err != nil {
+			info("definitions: %s", err)
+		}
+		behind, err := c.store.FetchChannels(remote)
+		if err != nil {
+			info("channels: %s", err)
+		}
+		for _, ch := range behind {
+			info("channel %s has unsent local messages; run `git track push --all` (or `git track say`) to merge", ch)
+		}
 		if flagJSON {
-			return printJSON(map[string]any{"fetched": true, "remote": remote})
+			return printJSON(map[string]any{"fetched": true, "remote": remote, "channelsBehind": behind})
 		}
 		info("metadata refs fetched from %s", remote)
 		return nil

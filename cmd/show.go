@@ -69,8 +69,8 @@ func printSummary(branch string, doc schema.Doc) {
 			fmt.Printf("  - %s\n", n)
 		}
 	}
-	if tags := stringList(doc["tags"]); len(tags) > 0 {
-		fmt.Printf("%s   %s\n", bold("tags:"), strings.Join(tags, ", "))
+	if labels := stringList(doc["labels"]); len(labels) > 0 {
+		fmt.Printf("%s %s\n", bold("labels:"), strings.Join(labels, ", "))
 	}
 	if links := stringList(doc["links"]); len(links) > 0 {
 		fmt.Printf("%s  %s\n", bold("links:"), strings.Join(links, " "))

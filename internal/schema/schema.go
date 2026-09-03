@@ -162,7 +162,7 @@ func Validate(d Doc, states []string) error {
 			}
 		}
 	}
-	for _, key := range []string{"next", "tags", "links"} {
+	for _, key := range []string{"next", "labels", "links"} {
 		if v, ok := d[key]; ok && v != nil {
 			arr, ok := v.([]any)
 			if !ok {
