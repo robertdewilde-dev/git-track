@@ -1,0 +1,34 @@
+BINARY  := git-track
+MODULE  := github.com/robertdewilde-dev/git-track
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -s -w
+OSES    := linux darwin windows
+ARCHES  := amd64 arm64
+
+.PHONY: build install test vet cross clean
+
+build:
+	go build -trimpath -ldflags '$(LDFLAGS)' -o bin/$(BINARY) .
+
+install:
+	go install -trimpath -ldflags '$(LDFLAGS)' .
+
+test:
+	go test ./...
+
+vet:
+	go vet ./...
+
+cross:
+	@for os in $(OSES); do \
+		for arch in $(ARCHES); do \
+			ext=""; [ $$os = windows ] && ext=".exe"; \
+			out=dist/$(BINARY)_$(VERSION)_$$os\_$$arch/$(BINARY)$$ext; \
+			echo "building $$out"; \
+			GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 \
+				go build -trimpath -ldflags '$(LDFLAGS)' -o $$out . || exit 1; \
+		done; \
+	done
+
+clean:
+	rm -rf bin dist
