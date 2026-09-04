@@ -7,11 +7,17 @@ ARCHES  := amd64 arm64
 
 .PHONY: build install test vet cross clean
 
+# The one binary answers to both `git track` (found by git as git-track) and
+# plain `track`; the second name is a symlink to the first.
+GOBIN   := $(or $(shell go env GOBIN),$(shell go env GOPATH)/bin)
+
 build:
 	go build -trimpath -ldflags '$(LDFLAGS)' -o bin/$(BINARY) .
+	ln -sf $(BINARY) bin/track
 
 install:
 	go install -trimpath -ldflags '$(LDFLAGS)' .
+	ln -sf $(GOBIN)/$(BINARY) $(GOBIN)/track
 
 test:
 	go test ./...

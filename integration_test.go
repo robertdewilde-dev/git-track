@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 var binPath string
@@ -618,8 +619,19 @@ func TestMCPServer(t *testing.T) {
 		t.Fatalf("get_branch_context errored: %v", call)
 	}
 	content := res["content"].([]any)[0].(map[string]any)["text"].(string)
-	if !strings.Contains(content, `"state": "in-progress"`) {
+	if !strings.Contains(content, `"state":"in-progress"`) { // compact JSON: no indentation tokens
 		t.Fatalf("unexpected tool result: %s", content)
+	}
+
+	send(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_overview","arguments":{}}}`)
+	ov := recv()["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(ov, `"branches":[{"branch":"main","state":"in-progress"`) || !strings.Contains(ov, `"name":"main"`) {
+		t.Fatalf("get_overview: %s", ov)
+	}
+	send(`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search","arguments":{"text":"progress"}}}`)
+	sr := recv()["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(sr, `"matched":"state"`) {
+		t.Fatalf("search: %s", sr)
 	}
 
 	send(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"set_field","arguments":{"key":"agent.notes","value":"via mcp"}}}`)
@@ -652,6 +664,7 @@ func TestSayChatRoundTrip(t *testing.T) {
 	var res struct {
 		Channel  string `json:"channel"`
 		Messages []struct {
+			SHA    string   `json:"sha"`
 			By     string   `json:"by"`
 			Labels []string `json:"labels"`
 			Body   string   `json:"body"`
@@ -660,8 +673,13 @@ func TestSayChatRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &res); err != nil {
 		t.Fatalf("chat --json invalid: %v\n%s", err, out)
 	}
-	if res.Channel != "main" || len(res.Messages) != 2 {
-		t.Fatalf("expected 2 messages on #main, got %+v", res)
+	if res.Channel != "branches/main" || len(res.Messages) != 2 {
+		t.Fatalf("expected 2 messages on #branches/main, got %+v", res)
+	}
+	// --since returns only what came after a given message.
+	out = mustTrack(t, b, "chat", "--json", "--since", res.Messages[1].SHA)
+	if !strings.Contains(out, "token validation") || strings.Contains(out, "starting on") {
+		t.Fatalf("--since filter wrong:\n%s", out)
 	}
 	// Newest first.
 	if res.Messages[0].Body != "token validation moved to its own package" {
@@ -792,5 +810,342 @@ func TestContextIncludesChat(t *testing.T) {
 	out := mustTrack(t, a, "context")
 	if !strings.Contains(out, "Recent chat") || !strings.Contains(out, "left off at the token tests") {
 		t.Fatalf("context missing chat:\n%s", out)
+	}
+}
+
+// startWatch runs `git track watch` in the background and returns a function
+// that waits for it and yields stdout + exit code.
+func startWatch(t *testing.T, dir string, args ...string) func() (string, int) {
+	t.Helper()
+	cmd := exec.Command(binPath, append([]string{"watch"}, args...)...)
+	cmd.Dir = dir
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting watch: %v", err)
+	}
+	// Give the watcher its first (seeding) tick before anyone posts.
+	time.Sleep(700 * time.Millisecond)
+	return func() (string, int) {
+		err := cmd.Wait()
+		code := 0
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		} else if err != nil {
+			t.Fatalf("watch: %v (stderr: %s)", err, stderr.String())
+		}
+		return stdout.String(), code
+	}
+}
+
+func TestWatchSeesNewMessage(t *testing.T) {
+	remote, a := setup(t)
+	b := cloneOf(t, remote, "clone-b")
+	mustTrack(t, a, "say", "-c", "main", "already there") // existing history is not replayed
+
+	wait := startWatch(t, b, "main", "--once", "--timeout", "20s", "--interval", "300ms", "--json")
+	mustTrack(t, a, "say", "-c", "main", "anyone free to review?", "--label", "question")
+	out, code := wait()
+	if code != 0 {
+		t.Fatalf("watch exit %d, out: %s", code, out)
+	}
+	if strings.Contains(out, "already there") {
+		t.Fatalf("watch replayed old history:\n%s", out)
+	}
+	var msg struct {
+		Channel string   `json:"channel"`
+		Body    string   `json:"body"`
+		Labels  []string `json:"labels"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &msg); err != nil {
+		t.Fatalf("watch --json should emit one JSON object per line: %v\n%s", err, out)
+	}
+	if msg.Channel != "main" || msg.Body != "anyone free to review?" || len(msg.Labels) != 1 {
+		t.Fatalf("unexpected message: %+v", msg)
+	}
+}
+
+func TestWatchDefaultsAndTimeout(t *testing.T) {
+	remote, a := setup(t)
+	b := cloneOf(t, remote, "clone-b")
+	git(t, b, "checkout", "main")
+
+	// Nothing arrives: exit 2.
+	wait := startWatch(t, b, "--once", "--timeout", "1s", "--interval", "300ms")
+	if _, code := wait(); code != 2 {
+		t.Fatalf("timeout without messages should exit 2, got %d", code)
+	}
+
+	// Default watch covers the branch channel (a says without -c).
+	wait = startWatch(t, b, "--once", "--timeout", "20s", "--interval", "300ms")
+	mustTrack(t, a, "say", "branch-scoped note")
+	out, code := wait()
+	if code != 0 || !strings.Contains(out, "#branches/main") || !strings.Contains(out, "branch-scoped note") {
+		t.Fatalf("default watch missed branch channel (exit %d):\n%s", code, out)
+	}
+}
+
+func TestWatchSyncsUnsentAndSkipsOwnReplay(t *testing.T) {
+	remote, a := setup(t)
+	b := cloneOf(t, remote, "clone-b")
+	git(t, b, "checkout", "main")
+
+	// a has an unsent local message (offline), b posts meanwhile.
+	git(t, a, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git"))
+	track(t, a, "say", "-c", "planning", "offline note from a")
+	git(t, a, "remote", "set-url", "origin", remote)
+
+	wait := startWatch(t, a, "planning", "--once", "--timeout", "20s", "--interval", "300ms")
+	mustTrack(t, b, "say", "-c", "planning", "note from b")
+	out, code := wait()
+	if code != 0 || !strings.Contains(out, "note from b") {
+		t.Fatalf("watch should surface b's message (exit %d):\n%s", code, out)
+	}
+	if strings.Contains(out, "offline note from a") {
+		t.Fatalf("watch echoed a's own replayed message:\n%s", out)
+	}
+	// And a's unsent message got synced along the way.
+	mustTrack(t, b, "fetch")
+	if out := mustTrack(t, b, "chat", "planning"); !strings.Contains(out, "offline note from a") {
+		t.Fatalf("watch did not sync unsent message:\n%s", out)
+	}
+}
+
+func TestChannelDeleteAndPrune(t *testing.T) {
+	_, a := setup(t)
+	mustTrack(t, a, "say", "-c", "scratch", "temporary")
+	mustTrack(t, a, "channels", "delete", "scratch")
+	if _, _, code := track(t, a, "chat", "scratch"); code != 2 {
+		t.Fatalf("deleted channel should be gone locally (exit %d)", code)
+	}
+	if out := git(t, a, "ls-remote", "origin", "refs/meta/channels/*"); strings.Contains(out, "scratch") {
+		t.Fatalf("deleted channel still on remote: %s", out)
+	}
+
+	// A merged-and-deleted branch's channel is pruned like its metadata;
+	// main and named channels are not.
+	git(t, a, "checkout", "-b", "feature")
+	mustTrack(t, a, "say", "feature chatter")
+	mustTrack(t, a, "say", "-c", "main", "keep me")
+	git(t, a, "checkout", "main")
+	git(t, a, "branch", "-D", "feature")
+	out := mustTrack(t, a, "prune", "--remote", "--json")
+	if !strings.Contains(out, "branches/feature") {
+		t.Fatalf("prune should remove the branch channel:\n%s", out)
+	}
+	if out := mustTrack(t, a, "channels"); !strings.Contains(out, "main") || strings.Contains(out, "feature") {
+		t.Fatalf("channels after prune:\n%s", out)
+	}
+}
+
+// --- Token-aware reads: overview, unread cursors, search, label usage ---
+
+func TestOverviewAndUnreadCursors(t *testing.T) {
+	remote, a := setup(t)
+	mustTrack(t, a, "set", "state", "review")
+	mustTrack(t, a, "push")
+	mustTrack(t, a, "say", "-c", "main", "who can review #42?", "--label", "question")
+	mustTrack(t, a, "say", "branch note")
+
+	// The poster has nothing unread: their own posts advance the cursor.
+	var ov struct {
+		Branch   string `json:"branch"`
+		Branches []struct {
+			Branch string `json:"branch"`
+			State  string `json:"state"`
+		} `json:"branches"`
+		Channels []struct {
+			Name     string `json:"name"`
+			Messages int    `json:"messages"`
+			Unread   int    `json:"unread"`
+			Last     *struct {
+				Body string `json:"body"`
+			} `json:"last"`
+		} `json:"channels"`
+	}
+	readOverview := func(dir string) {
+		t.Helper()
+		out := mustTrack(t, dir, "overview", "--json")
+		if err := json.Unmarshal([]byte(out), &ov); err != nil {
+			t.Fatalf("overview --json invalid: %v\n%s", err, out)
+		}
+	}
+	unread := func(name string) int {
+		t.Helper()
+		for _, ch := range ov.Channels {
+			if ch.Name == name {
+				return ch.Unread
+			}
+		}
+		t.Fatalf("channel %s missing from overview: %+v", name, ov.Channels)
+		return -1
+	}
+	readOverview(a)
+	if ov.Branch != "main" || len(ov.Branches) != 1 || ov.Branches[0].State != "review" {
+		t.Fatalf("overview branches: %+v", ov)
+	}
+	if unread("main") != 0 || unread("branches/main") != 0 {
+		t.Fatalf("poster should have nothing unread: %+v", ov.Channels)
+	}
+
+	// A fresh clone sees everything as unread, reads it once, then nothing.
+	b := cloneOf(t, remote, "clone-b")
+	mustTrack(t, b, "fetch")
+	readOverview(b)
+	if unread("main") != 1 || unread("branches/main") != 1 {
+		t.Fatalf("fresh clone unread counts: %+v", ov.Channels)
+	}
+	if ov.Channels[1].Name != "main" || ov.Channels[1].Last == nil || ov.Channels[1].Last.Body != "who can review #42?" {
+		t.Fatalf("overview last message: %+v", ov.Channels)
+	}
+	out := mustTrack(t, b, "chat", "main", "--unread", "--json")
+	if !strings.Contains(out, "who can review") {
+		t.Fatalf("chat --unread missed the message: %s", out)
+	}
+	out = mustTrack(t, b, "chat", "main", "--unread", "--json")
+	if !strings.Contains(out, `"messages": []`) {
+		t.Fatalf("second --unread read should be empty: %s", out)
+	}
+	readOverview(b)
+	if unread("main") != 0 || unread("branches/main") != 1 {
+		t.Fatalf("after reading main: %+v", ov.Channels)
+	}
+
+	// Cursors are per worktree: a second worktree of the same clone still
+	// sees main as unread, and reading there leaves b's cursor alone.
+	wt := filepath.Join(filepath.Dir(b), "wt")
+	git(t, b, "worktree", "add", "-b", "feat", wt)
+	readOverview(wt)
+	if unread("main") != 1 {
+		t.Fatalf("worktree should have its own cursor: %+v", ov.Channels)
+	}
+	mustTrack(t, wt, "chat", "main")
+	readOverview(b)
+	if unread("main") != 0 {
+		t.Fatalf("b's cursor changed by worktree read: %+v", ov.Channels)
+	}
+
+	// A new message from a is unread again after fetch; a label-filtered
+	// read does not mark it read, an unfiltered one does.
+	mustTrack(t, a, "say", "-c", "main", "ping")
+	mustTrack(t, b, "fetch")
+	readOverview(b)
+	if unread("main") != 1 {
+		t.Fatalf("new message not unread: %+v", ov.Channels)
+	}
+	mustTrack(t, b, "chat", "main", "--label", "question")
+	readOverview(b)
+	if unread("main") != 1 {
+		t.Fatalf("label-filtered read must not mark read: %+v", ov.Channels)
+	}
+	mustTrack(t, b, "chat", "main")
+	readOverview(b)
+	if unread("main") != 0 {
+		t.Fatalf("plain read should mark read: %+v", ov.Channels)
+	}
+	// The cursor lives in the git dir, never in the working tree.
+	if _, err := os.Stat(filepath.Join(b, ".git", "track", "cursors", "main")); err != nil {
+		t.Fatalf("cursor file missing: %v", err)
+	}
+	if out := git(t, b, "status", "--porcelain"); out != "" {
+		t.Fatalf("working tree touched: %s", out)
+	}
+}
+
+func TestSearchAndLabelUsage(t *testing.T) {
+	_, a := setup(t)
+	mustTrack(t, a, "set", "title", "Refactor token refresh")
+	mustTrack(t, a, "set", "labels", `["bug","auth"]`)
+	mustTrack(t, a, "labels", "set", "bug", "Something is broken")
+	mustTrack(t, a, "say", "token refresh loops on 401", "--label", "bug")
+	mustTrack(t, a, "say", "-c", "main", "unrelated chatter")
+	git(t, a, "commit", "--allow-empty", "-m", "fix token refresh loop", "--trailer", "Label: bug")
+
+	// labels: defined ∪ used, with counts across branches, messages, commits.
+	out := mustTrack(t, a, "labels", "--json")
+	var rows []struct {
+		Name                        string `json:"name"`
+		Description                 string `json:"description"`
+		Branches, Messages, Commits int
+	}
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("labels --json invalid: %v\n%s", err, out)
+	}
+	want := map[string][3]int{"auth": {1, 0, 0}, "bug": {1, 1, 1}}
+	for _, r := range rows {
+		w, ok := want[r.Name]
+		if !ok {
+			t.Fatalf("unexpected label row %+v", r)
+		}
+		if [3]int{r.Branches, r.Messages, r.Commits} != w {
+			t.Fatalf("label %s counts = %v, want %v", r.Name, [3]int{r.Branches, r.Messages, r.Commits}, w)
+		}
+		delete(want, r.Name)
+	}
+	if len(want) != 0 {
+		t.Fatalf("labels missing: %v", want)
+	}
+
+	// From a label's perspective: everything carrying it, in one call.
+	var res struct {
+		Branches []struct {
+			Branch  string `json:"branch"`
+			Matched string `json:"matched"`
+		} `json:"branches"`
+		Messages []struct {
+			Channel string `json:"channel"`
+			Body    string `json:"body"`
+		} `json:"messages"`
+		Commits []struct {
+			Ref     string   `json:"ref"`
+			Subject string   `json:"subject"`
+			Labels  []string `json:"labels"`
+		} `json:"commits"`
+	}
+	parse := func(out string) {
+		t.Helper()
+		res.Branches, res.Messages, res.Commits = nil, nil, nil
+		if err := json.Unmarshal([]byte(out), &res); err != nil {
+			t.Fatalf("search --json invalid: %v\n%s", err, out)
+		}
+	}
+	parse(mustTrack(t, a, "labels", "show", "bug", "--json"))
+	if len(res.Branches) != 1 || len(res.Messages) != 1 || len(res.Commits) != 1 {
+		t.Fatalf("labels show bug: %+v", res)
+	}
+	if res.Messages[0].Channel != "branches/main" || res.Commits[0].Ref != "main" || res.Commits[0].Subject != "fix token refresh loop" {
+		t.Fatalf("labels show bug details: %+v", res)
+	}
+	// Text search spans metadata and messages (case-insensitive), not commits.
+	parse(mustTrack(t, a, "search", "TOKEN", "--json"))
+	if len(res.Branches) != 1 || res.Branches[0].Matched != "title" || len(res.Messages) != 1 || len(res.Commits) != 0 {
+		t.Fatalf("search TOKEN: %+v", res)
+	}
+	// Text + label narrows; commits join when a label is given.
+	parse(mustTrack(t, a, "search", "loop", "--label", "bug", "--json"))
+	if len(res.Branches) != 0 || len(res.Messages) != 1 || len(res.Commits) != 1 {
+		t.Fatalf("search loop --label bug: %+v", res)
+	}
+	if _, _, code := track(t, a, "search", "nonexistent-phrase"); code != 2 {
+		t.Fatalf("empty search exit = %d, want 2", code)
+	}
+	if _, _, code := track(t, a, "search"); code != 1 {
+		t.Fatalf("search without filters exit = %d, want 1", code)
+	}
+}
+
+func TestBinaryAnswersToBothNames(t *testing.T) {
+	_, a := setup(t)
+	link := filepath.Join(t.TempDir(), "track")
+	if err := os.Symlink(binPath, link); err != nil {
+		t.Skip("symlinks unsupported:", err)
+	}
+	out, _, code := runIn(t, a, link, "--help")
+	if code != 0 || !strings.Contains(out, "track [command]") || strings.Contains(out, "git-track [command]") {
+		t.Fatalf("help under the track name:\n%s", out)
+	}
+	if out, _, code := runIn(t, a, link, "overview", "--json"); code != 0 || !strings.Contains(out, `"channels"`) {
+		t.Fatalf("track overview: %d %s", code, out)
 	}
 }

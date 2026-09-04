@@ -38,6 +38,18 @@ var renameCmd = &cobra.Command{
 		} else if err := c.store.DeleteRemote(remote, oldBranch); err != nil {
 			info("warning: could not delete %s on %s: %s", c.store.Ref(oldBranch), remote, err)
 		}
+		// The branch's channel moves with it.
+		oldCh, newCh := store.BranchChannel(oldBranch), store.BranchChannel(newBranch)
+		if tip := c.store.ChannelTip(oldCh); tip != "" && c.store.ChannelTip(newCh) == "" {
+			if _, err := c.git.Run("update-ref", c.store.ChannelRef(newCh), tip); err != nil {
+				return err
+			}
+			if err := c.store.SyncChannel(remote, newCh); err != nil {
+				info("warning: could not push channel %s: %s", newCh, err)
+			} else if err := c.store.DeleteChannel(remote, oldCh); err != nil {
+				info("warning: could not delete channel %s: %s", oldCh, err)
+			}
+		}
 		if flagJSON {
 			return printJSON(map[string]any{"renamed": true, "from": oldBranch, "to": newBranch})
 		}

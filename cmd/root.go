@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -78,6 +79,11 @@ func init() {
 	pf.BoolVarP(&flagQuiet, "quiet", "q", false, "suppress informational messages")
 	pf.BoolVar(&flagNoColor, "no-color", false, "disable colored output")
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
+	// The same binary answers to `git track` (as git-track) and, when
+	// installed under that name, to plain `track`. Show whichever was used.
+	if name := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe"); name == "track" {
+		rootCmd.Use = "track"
+	}
 }
 
 // Execute runs the CLI and returns the process exit code.

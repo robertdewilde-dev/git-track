@@ -38,10 +38,19 @@ func (s *Store) ChannelsNamespace() string {
 	return s.metaParent() + "/channels"
 }
 
-// ChannelRef returns the ref for one channel. Branch-scoped chat uses the
-// branch name as the channel name.
+// ChannelRef returns the ref for one channel.
 func (s *Store) ChannelRef(name string) string {
 	return s.ChannelsNamespace() + "/" + name
+}
+
+// MainChannel is the well-known coordination channel every repository has:
+// questions, fan-out, announcements — anything not tied to one branch.
+const MainChannel = "main"
+
+// BranchChannel is the name of a branch's own channel. Branch channels live
+// under "branches/" so they can never collide with named channels.
+func BranchChannel(branch string) string {
+	return "branches/" + branch
 }
 
 // DefsRef is the ref holding label and channel definitions
@@ -195,6 +204,89 @@ func (s *Store) SyncChannel(remote, channel string) error {
 	return &ConflictError{Ref: ref, Detail: "could not sync channel after retries"}
 }
 
+// messageKey identifies a message by content, independent of its commit SHA
+// (a replayed message gets a new SHA but the same key).
+func messageKey(m Message) string {
+	return m.By + "\x00" + m.Body + "\x00" + strings.Join(m.Labels, "\x00")
+}
+
+// PullChannel brings the local channel up to date with the remote tip
+// remoteSHA (fast-forward, or replay-and-push when local holds unsent
+// messages) and returns the messages new since `since` ("" = all), newest
+// first, excluding replays of messages that were already local. It also
+// returns the new local tip.
+func (s *Store) PullChannel(remote, channel, remoteSHA, since string) ([]Message, string, error) {
+	ref := s.ChannelRef(channel)
+	local := s.ChannelTip(channel)
+	var replayed map[string]bool
+	switch {
+	case remoteSHA == "" || remoteSHA == local:
+		// nothing to pull
+	case local == "" || s.isAncestor(local, remoteSHA):
+		if _, err := s.Git.Run("fetch", "--quiet", remote, ref+":"+ref); err != nil {
+			return nil, local, fmt.Errorf("fetching channel %s: %w", channel, err)
+		}
+	default:
+		// Local has unsent messages. Fetch the remote tip into FETCH_HEAD
+		// (leaves our ref alone), remember our local-only messages by
+		// content, then let SyncChannel replay them onto the remote tip.
+		if _, err := s.Git.Run("fetch", "--quiet", remote, ref); err != nil {
+			return nil, local, fmt.Errorf("fetching channel %s: %w", channel, err)
+		}
+		fetched, err := s.Git.Run("rev-parse", "FETCH_HEAD^{commit}")
+		if err != nil {
+			return nil, local, err
+		}
+		ours, _ := s.logMessages(ref, fetched, 0)
+		replayed = map[string]bool{}
+		for _, m := range ours {
+			replayed[messageKey(m)] = true
+		}
+		if err := s.SyncChannel(remote, channel); err != nil {
+			return nil, local, err
+		}
+	}
+	tip := s.ChannelTip(channel)
+	if tip == since || tip == "" {
+		return nil, tip, nil
+	}
+	msgs, err := s.MessagesSince(channel, since, 0)
+	if err != nil {
+		return nil, tip, err
+	}
+	if len(replayed) > 0 {
+		kept := msgs[:0]
+		for _, m := range msgs {
+			if !replayed[messageKey(m)] {
+				kept = append(kept, m)
+			}
+		}
+		msgs = kept
+	}
+	return msgs, tip, nil
+}
+
+// DeleteChannel removes a channel locally and on the remote. Messages are
+// gone from the remote; other clones keep their local copy until they delete
+// it too.
+func (s *Store) DeleteChannel(remote, channel string) error {
+	ref := s.ChannelRef(channel)
+	if s.ChannelTip(channel) != "" {
+		if _, err := s.Git.Run("update-ref", "-d", ref); err != nil {
+			return err
+		}
+	}
+	remoteSHA, err := s.RemoteSHA(remote, ref)
+	if err != nil {
+		return err
+	}
+	if remoteSHA == "" {
+		return nil
+	}
+	_, err = s.Git.Run("push", "--quiet", "--no-verify", remote, ":"+ref)
+	return err
+}
+
 // FetchChannels fast-forwards local channel refs from the remote. Local-only
 // messages make a ref non-fast-forwardable; those are reported, not clobbered
 // (they merge on the next say/push). Returns the channels left behind.
@@ -224,17 +316,56 @@ func (s *Store) FetchChannels(remote string) ([]string, error) {
 	return behind, nil
 }
 
+// ChannelTip returns the local tip of a channel, or "" when it has none.
+func (s *Store) ChannelTip(channel string) string {
+	sha, _ := s.Git.Run("rev-parse", "--verify", "--quiet", s.ChannelRef(channel))
+	return sha
+}
+
+// RemoteChannels returns every channel on the remote with its tip SHA, in a
+// single round trip and without transferring objects — cheap enough to poll.
+func (s *Store) RemoteChannels(remote string) (map[string]string, error) {
+	ns := s.ChannelsNamespace()
+	out, err := s.Git.Run("ls-remote", remote, ns+"/*")
+	if err != nil {
+		return nil, fmt.Errorf("cannot reach remote %q: %w", remote, err)
+	}
+	tips := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && strings.HasPrefix(fields[1], ns+"/") {
+			tips[strings.TrimPrefix(fields[1], ns+"/")] = fields[0]
+		}
+	}
+	return tips, nil
+}
+
 // Messages returns a channel's messages, newest first. limit <= 0 means all.
 func (s *Store) Messages(channel string, limit int) ([]Message, error) {
+	return s.MessagesSince(channel, "", limit)
+}
+
+// MessagesSince returns the messages reachable from the channel tip but not
+// from since (a commit SHA; "" means all), newest first.
+func (s *Store) MessagesSince(channel, since string, limit int) ([]Message, error) {
 	ref := s.ChannelRef(channel)
 	if _, err := s.Git.Run("rev-parse", "--verify", "--quiet", ref); err != nil {
 		return nil, ErrNoMetadata
 	}
+	return s.logMessages(ref, since, limit)
+}
+
+// logMessages parses `git log ref ^since` into messages, newest first.
+func (s *Store) logMessages(ref, since string, limit int) ([]Message, error) {
 	args := []string{"log", "--format=%H%x00%aI%x00%an%x00%B%x1e"}
 	if limit > 0 {
 		args = append(args, fmt.Sprintf("-n%d", limit))
 	}
-	args = append(args, ref, "--")
+	args = append(args, ref)
+	if since != "" {
+		args = append(args, "^"+since)
+	}
+	args = append(args, "--")
 	out, err := s.Git.Run(args...)
 	if err != nil {
 		return nil, err

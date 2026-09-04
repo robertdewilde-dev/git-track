@@ -35,7 +35,7 @@ var contextCmd = &cobra.Command{
 		if err != nil {
 			return jsonError(err)
 		}
-		msgs, _ := c.store.Messages(branch, 5)
+		msgs, _ := c.store.Messages(store.BranchChannel(branch), 5)
 		md := contextMarkdown(branch, doc, msgs)
 		if flagJSON {
 			return printJSON(map[string]any{"branch": branch, "markdown": md})
@@ -84,7 +84,7 @@ func contextMarkdown(branch string, doc schema.Doc, msgs []store.Message) string
 		}
 	}
 	if len(msgs) > 0 {
-		fmt.Fprintf(&b, "- **Recent chat** (`git track chat`):\n")
+		fmt.Fprintf(&b, "- **Recent chat** (`git track chat`; shared channel: `git track chat main`):\n")
 		for i := len(msgs) - 1; i >= 0; i-- { // oldest first
 			m := msgs[i]
 			labels := ""

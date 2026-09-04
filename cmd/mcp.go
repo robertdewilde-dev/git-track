@@ -7,8 +7,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/robertdewilde-dev/git-track/internal/lock"
 	"github.com/robertdewilde-dev/git-track/internal/schema"
+	"github.com/robertdewilde-dev/git-track/internal/store"
 	"github.com/spf13/cobra"
 )
 
@@ -101,11 +101,17 @@ func serveMCP(c *appCtx) error {
 	return scanner.Err()
 }
 
+// mcpTools lists the tools. Descriptions are deliberately terse: every word
+// here is loaded into the agent's context on every session.
 func mcpTools() []map[string]any {
-	branchProp := map[string]any{
-		"type":        "string",
-		"description": "Branch name. Omit to use the currently checked-out branch.",
+	str := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
+	num := func(desc string) map[string]any { return map[string]any{"type": "number", "description": desc} }
+	boolean := func(desc string) map[string]any { return map[string]any{"type": "boolean", "description": desc} }
+	strs := func(desc string) map[string]any {
+		return map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": desc}
 	}
+	branch := str("Branch name (default: checked-out branch)")
+	channel := str("Channel: 'main' (shared coordination), a topic name, or 'branches/<branch>' (default: this branch's channel)")
 	tool := func(name, desc string, props map[string]any, required ...string) map[string]any {
 		if required == nil {
 			required = []string{}
@@ -117,70 +123,91 @@ func mcpTools() []map[string]any {
 		}
 	}
 	return []map[string]any{
+		tool("get_overview",
+			"Start here: compact digest of all branches with metadata, all channels with unread counts and last message, and defined labels.",
+			map[string]any{}),
 		tool("get_branch_context",
-			"Read the full metadata document for a branch (issue number, title, state, context notes, next steps, labels, links, lock status). Returns JSON. Use this first to understand where work on a branch stands.",
-			map[string]any{"branch": branchProp}),
+			"Full metadata document of a branch (issue, title, state, context, next, labels, links, lock) as JSON.",
+			map[string]any{"branch": branch}),
 		tool("get_context_markdown",
-			"Read a branch's metadata as a prompt-ready markdown summary. Ideal for injecting branch context into a conversation.",
-			map[string]any{"branch": branchProp}),
+			"Branch metadata plus recent chat as prompt-ready markdown.",
+			map[string]any{"branch": branch}),
 		tool("list_branches",
-			"List every branch that has metadata, with its full document. Returns a JSON array of {branch, meta}.",
+			"Every branch with metadata and its full document.",
 			map[string]any{}),
 		tool("set_field",
-			"Set one metadata field. Dot paths reach nested fields (e.g. agent.notes). Values are parsed as JSON where sensible (arrays like [\"a\",\"b\"], numbers), otherwise stored as strings. state is validated against the configured state set (default: todo, in-progress, blocked, review, done).",
+			"Set one metadata field; dot paths reach nested fields (agent.notes). JSON arrays/numbers in value are parsed. state must be one of the configured states (default todo, in-progress, blocked, review, done).",
 			map[string]any{
-				"branch": branchProp,
-				"key":    map[string]any{"type": "string", "description": "Field name or dot path, e.g. state, title, context, next, agent.notes"},
-				"value":  map[string]any{"type": "string", "description": "Value to store; JSON arrays/numbers are parsed"},
+				"branch": branch,
+				"key":    str("Field or dot path: state, title, context, next, labels, agent.notes ..."),
+				"value":  str("Value; JSON arrays/numbers are parsed"),
 			}, "key", "value"),
 		tool("unset_field",
-			"Remove one metadata field by name or dot path.",
-			map[string]any{
-				"branch": branchProp,
-				"key":    map[string]any{"type": "string", "description": "Field name or dot path"},
-			}, "key"),
+			"Remove one metadata field.",
+			map[string]any{"branch": branch, "key": str("Field or dot path")}, "key"),
 		tool("acquire_lock",
-			"Acquire the distributed agent lock for a branch before making changes another agent might race on. The lock is enforced via a compare-and-swap push; if another actor holds it, this fails and you should work on something else or wait. Prefer setting a ttl so a crashed agent never wedges the branch.",
+			"Take the branch's agent lock (compare-and-swap push) before changes others might race on. Fails if another actor holds it. Set ttl so a crashed agent never wedges the branch.",
 			map[string]any{
-				"branch": branchProp,
-				"ttl":    map[string]any{"type": "string", "description": "Auto-expiry duration like 30m or 2h (recommended)"},
-				"force":  map[string]any{"type": "boolean", "description": "Steal a lock held by another actor"},
+				"branch": branch,
+				"ttl":    str("Auto-expiry like 30m or 2h (recommended)"),
+				"force":  boolean("Steal a lock held by someone else"),
 			}),
 		tool("release_lock",
-			"Release the agent lock for a branch when done working on it.",
-			map[string]any{"branch": branchProp}),
+			"Release the branch's agent lock.",
+			map[string]any{"branch": branch}),
 		tool("say",
-			"Post a message to an async channel shared across agents and machines. Without a channel it goes to the current branch's channel. Use it to leave findings, decisions, and progress notes for other agents (and your future self). The message syncs to the remote immediately; concurrent posts merge automatically.",
+			"Post a message to a channel (findings, decisions, questions, progress) for other agents. Syncs to the remote at once; concurrent posts merge. Then wait_for_message for a reply.",
 			map[string]any{
-				"text":    map[string]any{"type": "string", "description": "The message body"},
-				"channel": map[string]any{"type": "string", "description": "Channel name (e.g. a topic like 'android' or 'planning'). Omit for the current branch's channel."},
-				"labels":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Labels classifying the message (e.g. bug, decision). See list_labels for the shared vocabulary."},
+				"text":    str("Message body"),
+				"channel": channel,
+				"labels":  strs("Labels like bug, decision, question (see list_labels)"),
 			}, "text"),
 		tool("read_chat",
-			"Read a channel's recent messages (newest first). Without a channel it reads the current branch's channel. Messages from other machines arrive via fetch; run `git track fetch` first for the latest.",
+			"Read a channel's messages, newest first, and mark it read. unread=true returns only what arrived since you last read it here.",
 			map[string]any{
-				"channel": map[string]any{"type": "string", "description": "Channel name. Omit for the current branch's channel."},
-				"limit":   map[string]any{"type": "number", "description": "Max messages to return (default 20)"},
+				"channel": channel,
+				"limit":   num("Max messages (default 20)"),
+				"since":   str("Only messages after this sha"),
+				"unread":  boolean("Only messages since the channel was last read here"),
+			}),
+		tool("wait_for_message",
+			"Block until a new message lands on the watched channels or the timeout passes; returns the new messages (your own posts excluded). Default: this branch's channel and main.",
+			map[string]any{
+				"channels":        strs("Channels to watch"),
+				"all":             boolean("Watch every channel"),
+				"timeout_seconds": num("Give up after this long (default 60; keep under your tool-call timeout)"),
+			}),
+		tool("search",
+			"Find text (case-insensitive) and/or a label across branch metadata, chat messages in every channel, and git commits with a 'Label: <name>' trailer. Cheaper than reading channels.",
+			map[string]any{
+				"text":  str("Substring to look for"),
+				"label": str("Only items carrying this label"),
+				"limit": num("Max messages/commits (default 50)"),
 			}),
 		tool("list_channels",
-			"List channels: implicit per-branch channels that have messages, plus explicitly defined ones with their purpose.",
+			"Channels with descriptions: main, branches/<branch>, and named topics.",
 			map[string]any{}),
 		tool("list_labels",
-			"List the shared label vocabulary with each label's meaning. Labels classify both branch metadata (the labels field) and chat messages.",
+			"Label vocabulary with meanings and usage counts (branches, messages, commits).",
 			map[string]any{}),
 		tool("define_label",
-			"Define (or redefine) a label once with an explanation of what it means, shared across all branches and machines. Labels are optional documentation — undefined labels also work.",
-			map[string]any{
-				"name":        map[string]any{"type": "string", "description": "Label name, e.g. bug, android, decision"},
-				"description": map[string]any{"type": "string", "description": "What the label means"},
-			}, "name", "description"),
+			"Define or redefine a label's meaning for everyone. Labels are optional; undefined ones still work.",
+			map[string]any{"name": str("Label name"), "description": str("What it means")}, "name", "description"),
 		tool("define_channel",
-			"Define (or redefine) a named channel with its purpose, shared across branches and machines.",
-			map[string]any{
-				"name":        map[string]any{"type": "string", "description": "Channel name, e.g. planning"},
-				"description": map[string]any{"type": "string", "description": "What the channel is for"},
-			}, "name", "description"),
+			"Define or redefine a named channel's purpose for everyone.",
+			map[string]any{"name": str("Channel name"), "description": str("What it is for")}, "name", "description"),
 	}
+}
+
+// mcpPosted remembers messages posted through this server (channel + body) so
+// wait_for_message does not hand an agent its own words back.
+var mcpPosted = map[string]bool{}
+
+// compact renders a tool result as single-line JSON: nobody pretty-prints
+// for a model, and indentation is tokens.
+func compact(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 // callMCPTool executes one tool. Errors are returned as text with isError so
@@ -190,10 +217,28 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 		v, _ := args[key].(string)
 		return v
 	}
+	strs := func(key string) []string {
+		var out []string
+		if arr, ok := args[key].([]any); ok {
+			for _, v := range arr {
+				if s, ok := v.(string); ok {
+					out = append(out, s)
+				}
+			}
+		}
+		return out
+	}
+	num := func(key string, def int) int {
+		if n, ok := args[key].(float64); ok && n > 0 {
+			return int(n)
+		}
+		return def
+	}
+	noBranch := map[string]bool{"list_branches": true, "get_overview": true, "search": true, "list_channels": true, "list_labels": true, "define_label": true, "define_channel": true}
 	branch := str("branch")
 	if branch == "" {
 		var err error
-		if branch, err = c.branch(); err != nil && name != "list_branches" {
+		if branch, err = c.branch(); err != nil && !noBranch[name] {
 			return err.Error(), true
 		}
 	}
@@ -201,19 +246,24 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 		return fmt.Sprintf("%s (exit code %d)", err.Error(), exitCodeFor(err)), true
 	}
 	switch name {
+	case "get_overview":
+		ov, err := buildOverview(c)
+		if err != nil {
+			return fail(err)
+		}
+		return compact(ov), false
 	case "get_branch_context":
 		doc, _, err := c.store.Read(branch)
 		if err != nil {
 			return fail(err)
 		}
-		b, _ := doc.Marshal()
-		return string(b), false
+		return compact(doc), false
 	case "get_context_markdown":
 		doc, _, err := c.store.Read(branch)
 		if err != nil {
 			return fail(err)
 		}
-		msgs, _ := c.store.Messages(branch, 5)
+		msgs, _ := c.store.Messages(store.BranchChannel(branch), 5)
 		return contextMarkdown(branch, doc, msgs), false
 	case "list_branches":
 		branches, err := c.store.Branches()
@@ -226,8 +276,7 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 				rows = append(rows, map[string]any{"branch": b, "meta": doc})
 			}
 		}
-		b, _ := json.MarshalIndent(rows, "", "  ")
-		return string(b), false
+		return compact(rows), false
 	case "set_field":
 		key := str("key")
 		if key == "" || key == "schemaVersion" {
@@ -239,8 +288,7 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 		if err != nil {
 			return fail(err)
 		}
-		b, _ := doc.Marshal()
-		return string(b), false
+		return compact(doc), false
 	case "unset_field":
 		key := str("key")
 		if key == "" || key == "schemaVersion" {
@@ -282,20 +330,13 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 		}
 		channel := str("channel")
 		if channel == "" {
-			channel = branch
+			channel = store.BranchChannel(branch)
 		}
-		var labels []string
-		if arr, ok := args["labels"].([]any); ok {
-			for _, v := range arr {
-				if s, ok := v.(string); ok {
-					labels = append(labels, s)
-				}
-			}
-		}
-		sha, err := c.store.AppendMessage(channel, text, lock.Actor(), labels)
+		sha, err := postMessage(c, channel, text, strs("labels"))
 		if err != nil {
 			return fail(err)
 		}
+		mcpPosted[channel+"\x00"+text] = true
 		note := ""
 		if err := c.store.SyncChannel(c.remote(), channel); err != nil {
 			note = " (saved locally; remote sync failed: " + err.Error() + ")"
@@ -304,44 +345,59 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 	case "read_chat":
 		channel := str("channel")
 		if channel == "" {
-			channel = branch
+			channel = store.BranchChannel(branch)
 		}
-		limit := 20
-		if n, ok := args["limit"].(float64); ok && n > 0 {
-			limit = int(n)
+		since, limit := str("since"), num("limit", 20)
+		if unread, _ := args["unread"].(bool); unread {
+			since, limit = c.store.Cursor(channel), 0
 		}
-		msgs, err := c.store.Messages(channel, limit)
+		msgs, err := c.store.MessagesSince(channel, since, limit)
 		if err != nil {
 			return fail(err)
 		}
-		b, _ := json.MarshalIndent(map[string]any{"channel": channel, "messages": msgs}, "", "  ")
-		return string(b), false
-	case "list_channels", "list_labels":
-		section := "channels"
-		if name == "list_labels" {
-			section = "labels"
+		_ = c.store.MarkRead(channel)
+		if msgs == nil {
+			msgs = []store.Message{}
 		}
-		defs, _, _ := c.store.ReadDefs()
-		entries := map[string]any{}
-		if defs != nil {
-			if m, ok := defs[section].(map[string]any); ok {
-				entries = m
+		return compact(map[string]any{"channel": channel, "messages": msgs}), false
+	case "wait_for_message":
+		opts := watchOptions{interval: 2 * time.Second, timeout: 60 * time.Second, once: true}
+		if n, ok := args["timeout_seconds"].(float64); ok && n > 0 {
+			opts.timeout = time.Duration(n * float64(time.Second))
+		}
+		opts.all, _ = args["all"].(bool)
+		opts.channels = strs("channels")
+		if len(opts.channels) == 0 && !opts.all {
+			opts.channels = []string{store.MainChannel, store.BranchChannel(branch)}
+		}
+		got := []store.ChannelMessage{}
+		_, err := watchChannels(c, opts, func(channel string, m store.Message) {
+			if mcpPosted[channel+"\x00"+m.Body] {
+				return // our own post echoing back
 			}
+			got = append(got, store.ChannelMessage{Channel: channel, Message: m})
+		})
+		if err != nil {
+			return fail(err)
 		}
-		rows := []map[string]any{}
-		for n, v := range entries {
-			rows = append(rows, map[string]any{"name": n, "description": defDescription(v)})
+		if len(got) == 0 {
+			return fmt.Sprintf("no new messages within %s", opts.timeout), false
 		}
-		if section == "channels" {
-			existing, _ := c.store.Channels()
-			for _, n := range existing {
-				if _, ok := entries[n]; !ok {
-					rows = append(rows, map[string]any{"name": n, "description": ""})
-				}
-			}
+		return compact(map[string]any{"messages": got}), false
+	case "search":
+		res, err := runSearch(c, str("text"), str("label"), num("limit", 50))
+		if err != nil {
+			return fail(err)
 		}
-		b, _ := json.MarshalIndent(rows, "", "  ")
-		return string(b), false
+		return compact(res), false
+	case "list_channels":
+		ov, err := buildOverview(c)
+		if err != nil {
+			return fail(err)
+		}
+		return compact(ov.Channels), false
+	case "list_labels":
+		return compact(labelRows(c)), false
 	case "define_label", "define_channel":
 		section, one := "labels", "label"
 		if name == "define_channel" {

@@ -29,7 +29,9 @@ make install        # go install
 make cross          # all six linux/darwin/windows × amd64/arm64 binaries
 ```
 
-Put `git-track` on your `PATH` and git exposes it as `git track`.
+Put `git-track` on your `PATH` and git exposes it as `git track`. `make
+build`/`make install` also add a `track` symlink to the same binary, so
+`track say "..."` and `git track say "..."` are the same command.
 
 ## Quick start
 
@@ -63,13 +65,16 @@ git track set --from-json <file|-> Replace whole document (validated)
 git track get [key]                Read one field or whole doc
 git track unset <key>              Remove a field
 git track show [branch]            Human-readable summary
+git track overview                 One-screen digest: branches, channels + unread, labels
 git track list                     Table of all branches with metadata
 git track log [branch]             History of metadata changes
 git track lock / unlock            Acquire/release the agent lock
-git track say <msg>                Post to a channel (-c <name>; default: this branch)
-git track chat [channel]           Read a channel's messages
-git track channels                 List channels (set/unset define them)
-git track labels                   List the shared label vocabulary (set/unset define)
+git track say <msg>                Post to a channel (-c main | -c <name>; default: this branch)
+git track chat [channel]           Read a channel's messages (--unread: only what's new for you)
+git track watch [channel...]       Stream new messages live (--once --timeout to await a reply)
+git track search [text] [--label]  Find text/labels across metadata, chat, and commits
+git track channels                 List channels (set/unset define, delete removes)
+git track labels                   Label vocabulary with usage counts (show <name> lists uses)
 git track push [branch]            Push metadata refs (--all for every branch)
 git track fetch                    Fetch metadata refs
 git track prune                    Delete metadata for branches that no longer exist
@@ -85,9 +90,15 @@ Global flags: `--json`, `--branch <name>`, `--quiet`, `--no-color`.
 
 ## For agents
 
+- `git track overview --json` — start here: every branch, every channel with
+  its unread count and last message, and the labels, in one call.
 - `git track get --json` / `git track list --json` — machine output on stdout,
   valid JSON even on error (`{"error": "...", "code": 2}`).
 - `git track context` — a prompt-ready markdown summary of the branch.
+- `git track chat main --unread` — only what arrived since you last read it
+  (cursor is per clone and per worktree, kept in the git dir).
+- `git track search "token refresh"` / `--label bug` — find things without
+  loading whole channels.
 - `git track mcp` — a Model Context Protocol server over stdio. Example
   Claude Code registration:
 
@@ -95,29 +106,62 @@ Global flags: `--json`, `--branch <name>`, `--quiet`, `--no-color`.
   claude mcp add git-track -- git-track mcp
   ```
 
-  Tools: `get_branch_context`, `get_context_markdown`, `list_branches`,
-  `set_field`, `unset_field`, `acquire_lock`, `release_lock`, `say`,
-  `read_chat`, `list_channels`, `list_labels`, `define_label`,
-  `define_channel`.
+  Tools: `get_overview`, `get_branch_context`, `get_context_markdown`,
+  `list_branches`, `set_field`, `unset_field`, `acquire_lock`,
+  `release_lock`, `say`, `read_chat`, `wait_for_message`, `search`,
+  `list_channels`, `list_labels`, `define_label`, `define_channel`.
+  Results are compact JSON and descriptions are terse: every word costs
+  tokens on every session.
 
-## Channels: `say` and `chat`
+## Channels: `say`, `chat`, `watch`
 
-Agents (and you) can leave messages for each other — findings, decisions,
-progress — as an async timeline stored in git, one commit per message under
+Agents (and you) can talk to each other — findings, decisions, questions,
+progress — through channels stored in git, one commit per message under
 `refs/meta/channels/<name>`:
 
 ```sh
 git track say "auth refactor done; token tests still failing" --label finding
 git track chat                        # read this branch's channel
+git track say -c main "anyone free to review #42?" --label question
+git track chat main                   # the shared coordination channel
 git track say -c android "emulator flaky on API 35" --label bug
-git track chat android                # named channels span branches
 ```
 
-Every branch implicitly has a channel named after it; named channels are
-shared. Posting pushes immediately, and concurrent posts from other machines
-merge automatically (messages are replayed onto the remote tip, never lost).
-Reading is pull-based: `git track fetch`, then `chat`. Offline posts stay
-local and merge on the next `say` or `git track push --all`.
+Three kinds of channel, one namespace:
+
+- **`main`** — always there. Coordination, fan-out, questions: anything not
+  tied to one branch lands here.
+- **`branches/<branch>`** — every branch's own channel; the default for `say`
+  and `chat`.
+- **named** (`android`, `planning`) — topics that span branches.
+
+Posting pushes immediately, and concurrent posts from other machines merge
+automatically (messages are replayed onto the remote tip, never lost).
+Offline posts stay local and merge on the next `say`, `watch`, or
+`git track push --all`.
+
+### Live: `watch`
+
+Reading is pull-based, but you don't have to poll by hand:
+
+```sh
+git track watch                       # this branch + main, like tail -f
+git track watch --all --json          # every channel, one JSON object per line
+git track watch main --once --timeout 5m   # block until someone replies
+```
+
+`watch` polls the remote with one cheap `ls-remote` per interval (default
+2s) and fetches only when a channel changed. Whatever exists when you start
+counts as seen; `--tail 5` prints recent history first. In MCP the same loop
+is the `wait_for_message` tool: an agent says something, then waits for the
+reply — that's live agent-to-agent conversation with nothing but a git
+remote in between.
+
+Merged branches need no cleanup — channels are independent refs; a branch's
+channel stays as history and `git track prune` removes it once the branch is
+gone (`main` and named channels are never pruned). `git track channels
+delete <name>` removes a channel locally and remotely; it's a plain ref
+delete, no consensus needed.
 
 Labels are a shared, optional vocabulary — define one once with an
 explanation and every machine sees it:
@@ -128,8 +172,32 @@ git track channels set planning "Cross-branch planning notes"
 git track labels                      # list with meanings
 ```
 
-The same labels classify branch metadata (`git track set labels '["bug"]'`)
-and messages. Undefined labels still work; you just get a hint.
+The same labels classify branch metadata (`git track set labels '["bug"]'`),
+messages, and ordinary git commits — add a trailer and the commit joins the
+vocabulary (git-track only reads it, it never writes your commits):
+
+```sh
+git commit -m "fix token refresh loop" --trailer "Label: bug"
+git track labels                      # bug: 1 branch, 3 messages, 1 commit
+git track labels show bug             # every branch, message, and commit carrying it
+```
+
+Undefined labels still work; you just get a hint.
+
+## Staying cheap to read
+
+Agents pay for every token they read, so reads are sized to what changed:
+
+```sh
+git track overview                    # branches, channels with unread counts, labels
+git track chat main --unread          # only what's new since you last read it here
+git track search "emulator"           # metadata + all channels, one git log
+git track search --label bug          # + commits with a "Label: bug" trailer
+```
+
+Read cursors live in the git dir, per clone and per worktree, and are never
+synced. Nothing is indexed or stored: the refs are the index, so there is
+nothing to keep consistent.
 
 ## Locking
 

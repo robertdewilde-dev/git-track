@@ -182,10 +182,28 @@ By: robert@robert-desktop
 ```
 
 `Label:` may repeat; `By:` identifies the actor (the git author is a
-fallback). Every branch implicitly has a channel named after it; named
-channels (`android`, `planning`) span branches. `git track say` posts,
-`git track chat` reads, and reading is **pull-based**: poll with
-`git track fetch`.
+fallback). Channel names are ref-relative paths in one namespace:
+
+| Channel | Purpose |
+|---|---|
+| `main` | Always exists (listed even before its first message). Shared coordination: questions, fan-out, announcements. |
+| `branches/<branch>` | The branch's own channel; default for `say`/`chat`/`context`. Moved by `git track rename`, removed by `git track prune` once the branch is gone. |
+| any other name | Named topic channel spanning branches (`android`, `planning`). Never pruned. |
+
+`git track say` posts, `git track chat` reads (`--since <sha>` for
+catch-up), and `git track watch` streams: it polls the remote with one
+`ls-remote` on the channel namespace per interval (no object transfer),
+fetches a channel only when its tip changed, and prints the messages that
+landed after the watch started. `--once` + `--timeout` turn it into a
+blocking wait for a reply; the MCP `wait_for_message` tool is the same loop.
+There is no push notification — git has no post-fetch hook and server-side
+hooks cannot reach clients — so liveness equals the poll interval.
+
+`git track channels delete <name>` deletes the channel ref locally and on the
+remote. No consensus: it is a plain ref delete by anyone with push access.
+Other clones keep their local copy; a later post from such a clone recreates
+the channel with its old history. Merging a branch needs no channel work —
+channels are independent refs.
 
 Posting appends a commit to the channel ref (CAS on the old tip) and pushes
 immediately with `--force-with-lease`. On rejection the poster fetches the
@@ -209,18 +227,52 @@ refs/meta/defs/all
 }
 ```
 
-The same labels classify branch documents (the `labels` field) and messages
-(`Label:` trailers). Definitions are documentation, not enforcement: undefined
-labels and channels work; the CLI prints a stderr hint when a label is used
-that has no definition while a vocabulary exists.
+The same labels classify branch documents (the `labels` field), messages
+(`Label:` trailers), and **ordinary git commits**: a commit whose message
+carries a `Label: <name>` trailer (`git commit --trailer "Label: bug"`) is
+part of the vocabulary too. git-track never writes such commits (it never
+touches `refs/heads/*`); it only reads them. Definitions are documentation,
+not enforcement: undefined labels and channels work; the CLI prints a stderr
+hint when a label is used that has no definition while a vocabulary exists.
+
+`git track labels` lists every label that is defined *or* in use, with
+counts of branches, messages, and commits carrying it; `git track labels
+show <name>` (= `git track search --label <name>`) lists those uses.
+
+### Read cursors, overview, search
+
+Reads are meant to cost tokens in proportion to what changed, not to what
+exists:
+
+- **Cursors.** Every unfiltered `chat` read (and `watch`, and MCP
+  `read_chat`/`wait_for_message`) records the channel tip in
+  `<git-dir>/track/cursors/<channel>`. `chat --unread` returns only what
+  landed after it. Because the path resolves through `git rev-parse
+  --git-path`, cursors are per clone *and per worktree*; they are never
+  synced. A poster whose cursor was at the tip has their own post marked
+  read. A cursor pointing at a pruned object counts as "never read".
+- **`git track overview`** (MCP `get_overview`) is the one-call digest:
+  every branch with metadata (state, issue, title, labels, lock), every
+  channel with message count, unread count, and last message, and the label
+  vocabulary. Generated on demand from local refs — nothing is stored, so
+  there is no index to keep consistent.
+- **`git track search [text] [--label <name>]`** (MCP `search`) runs one
+  `git log --grep` across all channel refs (case-insensitive literal text
+  and/or an anchored `^Label: <name>$` line) plus a walk over branch
+  documents (any string field; the match reports the dot path in
+  `matched`). With `--label`, commits on local and remote-tracking branches
+  carrying the trailer are included too. Text without a label does not
+  search commit messages — that is `git log --grep`.
+- MCP tool results are compact JSON (no indentation).
 
 **Sync path:** channel and defs refs are deliberately *not* added to the
 configured refspecs. A channel ref with unsent local messages is not
 fast-forwardable, and a configured non-forced refspec would make plain
 `git fetch` exit non-zero — so these refs sync only through the tool:
-`say` (auto-push), `git track push --all`, and `git track fetch` (which
-fast-forwards channels, force-updates defs, and reports channels holding
-unsent local messages instead of clobbering them).
+`say` (auto-push), `watch` (syncs unsent messages on channels it watches),
+`git track push --all`, and `git track fetch` (which fast-forwards channels,
+force-updates defs, and reports channels holding unsent local messages
+instead of clobbering them).
 
 ## MCP server
 
@@ -228,12 +280,15 @@ unsent local messages instead of clobbering them).
 one message per line, protocol version `2024-11-05`). Register it in an agent
 client as command `git-track`, args `["mcp"]`, run from inside the repository.
 
-Tools: `get_branch_context`, `get_context_markdown`, `list_branches`,
-`set_field`, `unset_field`, `acquire_lock`, `release_lock`, `say`,
-`read_chat`, `list_channels`, `list_labels`, `define_label`,
-`define_channel`. Branch-scoped tools accept an optional `branch` argument,
-defaulting to the checked-out branch. Errors come back as tool results with
-`isError: true` and include the CLI exit code.
+Tools: `get_overview`, `get_branch_context`, `get_context_markdown`,
+`list_branches`, `set_field`, `unset_field`, `acquire_lock`, `release_lock`,
+`say`, `read_chat` (`unread` flag), `wait_for_message`, `search`,
+`list_channels`, `list_labels`, `define_label`, `define_channel`.
+Branch-scoped tools accept an optional `branch` argument, defaulting to the
+checked-out branch. Results are compact JSON; errors come back as tool
+results with `isError: true` and include the CLI exit code. Tool
+descriptions are kept terse on purpose: they are loaded into the agent's
+context on every session.
 
 ## Sync configuration
 

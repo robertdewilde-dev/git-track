@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"strings"
+
+	"github.com/robertdewilde-dev/git-track/internal/store"
 	"github.com/spf13/cobra"
 )
 
@@ -38,13 +41,37 @@ var pruneCmd = &cobra.Command{
 			pruned = append(pruned, b)
 			info("pruned metadata for %s", b)
 		}
+		// Branch channels follow the same rule: gone branch, gone channel.
+		// Named channels (main, planning, ...) are never pruned.
+		channels, _ := c.store.Channels()
+		var prunedChannels []string
+		for _, ch := range channels {
+			b, isBranch := strings.CutPrefix(ch, store.BranchChannel(""))
+			if !isBranch || refExists(c, "refs/heads/"+b) || refExists(c, "refs/remotes/"+remote+"/"+b) {
+				continue
+			}
+			if !dryRun {
+				if alsoRemote {
+					if err := c.store.DeleteChannel(remote, ch); err != nil {
+						info("warning: could not delete channel %s: %s", ch, err)
+					}
+				} else if _, err := c.git.Run("update-ref", "-d", c.store.ChannelRef(ch)); err != nil {
+					return err
+				}
+			}
+			prunedChannels = append(prunedChannels, ch)
+			info("pruned channel %s", ch)
+		}
 		if flagJSON {
 			if pruned == nil {
 				pruned = []string{}
 			}
-			return printJSON(map[string]any{"pruned": pruned, "dryRun": dryRun})
+			if prunedChannels == nil {
+				prunedChannels = []string{}
+			}
+			return printJSON(map[string]any{"pruned": pruned, "prunedChannels": prunedChannels, "dryRun": dryRun})
 		}
-		if len(pruned) == 0 {
+		if len(pruned)+len(prunedChannels) == 0 {
 			info("nothing to prune")
 		}
 		return nil

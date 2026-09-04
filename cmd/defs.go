@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
-	"strconv"
 	"text/tabwriter"
 
 	"github.com/robertdewilde-dev/git-track/internal/schema"
@@ -102,51 +100,100 @@ func hintUndefinedLabels(c *appCtx, labels []string) {
 	}
 }
 
-func listDefs(c *appCtx, section string, extra map[string]int) error {
+// labelRow is one label with its meaning and where it is used.
+type labelRow struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Branches    int    `json:"branches"`
+	Messages    int    `json:"messages"`
+	Commits     int    `json:"commits"`
+}
+
+// labelRows lists every label that is defined or in use — on branch
+// metadata, on chat messages, or as a "Label:" trailer on ordinary commits —
+// with counts. Sorted by name.
+func labelRows(c *appCtx) []labelRow {
+	doc, _, err := c.store.ReadDefs()
+	defined := map[string]any{}
+	if err == nil {
+		if m, ok := doc["labels"].(map[string]any); ok {
+			defined = m
+		}
+	}
+	branchUse := map[string]int{}
+	if branches, err := c.store.Branches(); err == nil {
+		for _, b := range branches {
+			if d, _, err := c.store.Read(b); err == nil {
+				for _, l := range stringList(d["labels"]) {
+					branchUse[l]++
+				}
+			}
+		}
+	}
+	msgUse, commitUse := c.store.LabelUsage()
+	names := map[string]bool{}
+	for _, m := range []map[string]int{branchUse, msgUse, commitUse} {
+		for n := range m {
+			names[n] = true
+		}
+	}
+	for n := range defined {
+		names[n] = true
+	}
+	rows := []labelRow{}
+	for _, n := range sortedKeys(names) {
+		rows = append(rows, labelRow{Name: n, Description: defDescription(defined[n]),
+			Branches: branchUse[n], Messages: msgUse[n], Commits: commitUse[n]})
+	}
+	return rows
+}
+
+func listLabels(c *appCtx) error {
+	rows := labelRows(c)
+	if flagJSON {
+		return printJSON(rows)
+	}
+	if len(rows) == 0 {
+		return exitErr(ExitNoMetadata, "no labels defined or in use")
+	}
+	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "LABEL\tBRANCHES\tMESSAGES\tCOMMITS\tDESCRIPTION")
+	for _, r := range rows {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\n", r.Name, r.Branches, r.Messages, r.Commits, r.Description)
+	}
+	return w.Flush()
+}
+
+func listChannels(c *appCtx, counts map[string]int) error {
 	doc, _, err := c.store.ReadDefs()
 	entries := map[string]any{}
 	if err == nil {
-		if m, ok := doc[section].(map[string]any); ok {
+		if m, ok := doc["channels"].(map[string]any); ok {
 			entries = m
 		}
+	}
+	if _, ok := entries[store.MainChannel]; !ok {
+		entries[store.MainChannel] = map[string]any{"description": "Shared coordination channel: questions, fan-out, announcements — anything not tied to one branch"}
 	}
 	names := map[string]bool{}
 	for n := range entries {
 		names[n] = true
 	}
-	for n := range extra {
+	for n := range counts {
 		names[n] = true
 	}
-	if len(names) == 0 {
-		return jsonError(exitErr(ExitNoMetadata, "no %s defined", section))
-	}
-	sorted := make([]string, 0, len(names))
-	for n := range names {
-		sorted = append(sorted, n)
-	}
-	sort.Strings(sorted)
+	sorted := sortedKeys(names)
 	if flagJSON {
 		rows := []map[string]any{}
 		for _, n := range sorted {
-			row := map[string]any{"name": n, "description": defDescription(entries[n])}
-			if extra != nil {
-				row["messages"] = extra[n]
-			}
-			rows = append(rows, row)
+			rows = append(rows, map[string]any{"name": n, "description": defDescription(entries[n]), "messages": counts[n]})
 		}
 		return printJSON(rows)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	if extra != nil {
-		fmt.Fprintln(w, "CHANNEL\tMESSAGES\tDESCRIPTION")
-		for _, n := range sorted {
-			fmt.Fprintf(w, "%s\t%d\t%s\n", n, extra[n], defDescription(entries[n]))
-		}
-	} else {
-		fmt.Fprintln(w, "LABEL\tDESCRIPTION")
-		for _, n := range sorted {
-			fmt.Fprintf(w, "%s\t%s\n", n, defDescription(entries[n]))
-		}
+	fmt.Fprintln(w, "CHANNEL\tMESSAGES\tDESCRIPTION")
+	for _, n := range sorted {
+		fmt.Fprintf(w, "%s\t%d\t%s\n", n, counts[n], defDescription(entries[n]))
 	}
 	return w.Flush()
 }
@@ -210,21 +257,37 @@ func defineCmds(section, one string) (*cobra.Command, *cobra.Command, *cobra.Com
 
 func init() {
 	labelsCmd, _, _ := defineCmds("labels", "label")
-	labelsCmd.Long = `Labels are a shared, optional vocabulary used to classify both branch
-metadata (the "labels" field) and chat messages (git track say --label).
+	labelsCmd.Long = `Labels are a shared, optional vocabulary used to classify branch metadata
+(the "labels" field), chat messages (git track say --label), and ordinary
+git commits (a "Label: <name>" trailer, e.g. git commit --trailer "Label: bug").
 Defining a label records what it means, once, for every agent and machine.
-Undefined labels still work — definitions are documentation, not enforcement.`
+Undefined labels still work — definitions are documentation, not enforcement.
+The list shows where each label is used; 'labels show <name>' lists the uses.`
 	labelsCmd.RunE = func(cmd *cobra.Command, args []string) error {
 		c, err := newCtx()
 		if err != nil {
 			return jsonError(err)
 		}
-		return listDefs(c, "labels", nil)
+		return listLabels(c)
 	}
+	labelsCmd.AddCommand(&cobra.Command{
+		Use:   "show <name>",
+		Short: "Everything carrying a label: branches, messages, commits (same as search --label)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := newCtx()
+			if err != nil {
+				return jsonError(err)
+			}
+			return searchAndPrint(c, "", args[0], 0)
+		},
+	})
 
 	channelsCmd, _, _ := defineCmds("channels", "channel")
 	channelsCmd.Long = `Channels are async message streams shared across branches and machines
-(see git track say / chat). Every branch implicitly has one named after it;
+(see git track say / chat / watch). Every repository has "main" — the shared
+coordination channel where anything can land: questions, fan-out,
+announcements. Every branch has its own channel (branches/<branch>), and
 named channels ("android", "planning") span branches. Defining a channel
 records its purpose; posting to an undefined channel also just works.`
 	channelsCmd.RunE = func(cmd *cobra.Command, args []string) error {
@@ -232,18 +295,38 @@ records its purpose; posting to an undefined channel also just works.`
 		if err != nil {
 			return jsonError(err)
 		}
-		counts := map[string]int{}
+		counts := map[string]int{store.MainChannel: 0}
 		existing, _ := c.store.Channels()
 		for _, name := range existing {
-			counts[name] = 0
-			if out, err := c.git.Run("rev-list", "--count", c.store.ChannelRef(name)); err == nil {
-				if n, err := strconv.Atoi(out); err == nil {
-					counts[name] = n
-				}
-			}
+			counts[name] = c.store.MessageCount(name)
 		}
-		return listDefs(c, "channels", counts)
+		return listChannels(c, counts)
 	}
+	channelsCmd.AddCommand(&cobra.Command{
+		Use:   "delete <name>",
+		Short: "Delete a channel and its messages, locally and on the remote",
+		Long: `Delete a channel: the ref is removed locally and on the remote, so its
+messages disappear for everyone who fetches. No consensus is required — it
+is a plain ref delete by anyone with push access. Other clones keep their
+local copy until they delete it too (a later post from such a clone
+recreates the channel with its old history). The definition, if any, stays;
+remove it with 'channels unset'.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := newCtx()
+			if err != nil {
+				return jsonError(err)
+			}
+			if err := c.store.DeleteChannel(c.remote(), args[0]); err != nil {
+				return jsonError(err)
+			}
+			if flagJSON {
+				return printJSON(map[string]any{"deleted": args[0]})
+			}
+			info("channel %q deleted", args[0])
+			return nil
+		},
+	})
 
 	rootCmd.AddCommand(labelsCmd, channelsCmd)
 }

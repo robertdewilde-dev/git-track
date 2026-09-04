@@ -6,6 +6,8 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 
 ## Using the tool as an agent
 
+- Start with `git track overview --json`: every branch, every channel with
+  unread counts, the labels — one call.
 - Read state: `git track get --json` (whole doc) or `git track get state`.
   Exit `2` + `{"error":...,"code":2}` means no metadata yet — that is normal,
   not a failure.
@@ -14,11 +16,17 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 - Before changes another agent might race on: `git track lock --ttl 30m`;
   exit `3` means someone else holds it. `git track unlock` when done.
 - Exit `5` on any push means fetch first: `git track fetch`, then retry.
-- Leave notes for other agents: `git track say "finding..." --label bug`
-  posts to this branch's channel (`-c <name>` for a cross-branch channel);
-  `git track fetch` + `git track chat` reads. Concurrent posts merge
-  automatically. Define labels/channels once with
+- Talk to other agents: `git track say "finding..." --label bug` posts to
+  this branch's channel; `-c main` for the shared coordination channel
+  (questions, fan-out), `-c <topic>` for named ones. `git track chat [channel]`
+  reads; `git track watch --once --timeout 5m` (MCP: `wait_for_message`)
+  blocks until someone replies. Concurrent posts merge automatically.
+  `git track chat main --unread` reads only what is new for you (cursor per
+  clone and worktree). Define labels/channels once with
   `git track labels set <name> "<meaning>"` / `channels set`.
+- Find instead of read: `git track search "<text>"` (metadata + all
+  channels) or `git track search --label bug` (also commits carrying a
+  `Label: bug` trailer; add one with `git commit --trailer "Label: bug"`).
 - Prompt-ready summary: `git track context` (markdown, includes recent chat).
 - Preferred for MCP-capable agents: `git track mcp` runs a stdio MCP server
   (tools: get_branch_context, set_field, acquire_lock, ...).
@@ -30,9 +38,9 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 | Path | What it is |
 |---|---|
 | `main.go` | Entry point; exits with `cmd.Execute()`'s code. |
-| `cmd/` | Cobra subcommands, one file each. `root.go` has exit codes, global flags, the shared `mutateDoc` write path. `mcp.go` is the MCP stdio server. |
+| `cmd/` | Cobra subcommands, one file each. `root.go` has exit codes, global flags, the shared `mutateDoc` write path. `mcp.go` is the MCP stdio server (terse descriptions, compact JSON — on purpose). `overview.go`/`search.go`: the token-aware reads. `watch.go` has the poll loop shared by `watch` and MCP `wait_for_message`. |
 | `internal/gitcmd/` | The only place git is invoked. Swappable transport. |
-| `internal/store/` | Read/write metadata commits to refs; push/fetch with force-with-lease. `channels.go`: message streams (one commit per message) + shared label/channel definitions. No CLI or output concerns. |
+| `internal/store/` | Read/write metadata commits to refs; push/fetch with force-with-lease. `channels.go`: message streams (one commit per message) + shared label/channel definitions. `search.go`: per-worktree read cursors (`<git-dir>/track/cursors/`), cross-channel search, label usage incl. commit trailers. No CLI or output concerns. |
 | `internal/schema/` | Versioned document, validation, dot paths, unknown-field passthrough. |
 | `internal/lock/` | Lock identity (`user@machine:pid`), TTL expiry, actor comparison. |
 | `internal/hooks/` | post-checkout / pre-push install with chaining. |
@@ -46,6 +54,8 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 - Hooks must never fail a git operation.
 - Exit codes 0–5 are a published contract.
 - Startup must stay well under 10ms (runs on every checkout).
+- MCP tool descriptions stay terse and results compact: they are paid for in
+  tokens on every agent session.
 
 ## Development
 
