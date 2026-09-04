@@ -27,6 +27,9 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 - Find instead of read: `git track search "<text>"` (metadata + all
   channels) or `git track search --label bug` (also commits carrying a
   `Label: bug` trailer; add one with `git commit --trailer "Label: bug"`).
+- On a GitHub-backed repo with `gh` installed: `git track import [issue]`
+  fills issue/title/context/labels from the issue (number inferred from
+  the branch name or its PR). One-way; re-run to refresh.
 - Prompt-ready summary: `git track context` (markdown, includes recent chat).
 - Preferred for MCP-capable agents: `git track mcp` runs a stdio MCP server
   (tools: get_branch_context, set_field, acquire_lock, ...).
@@ -38,7 +41,7 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 | Path | What it is |
 |---|---|
 | `main.go` | Entry point; exits with `cmd.Execute()`'s code. |
-| `cmd/` | Cobra subcommands, one file each. `root.go` has exit codes, global flags, the shared `mutateDoc` write path. `mcp.go` is the MCP stdio server (terse descriptions, compact JSON — on purpose). `overview.go`/`search.go`: the token-aware reads. `watch.go` has the poll loop shared by `watch` and MCP `wait_for_message`. |
+| `cmd/` | Cobra subcommands, one file each. `root.go` has exit codes, global flags, the shared `mutateDoc` write path. `mcp.go` is the MCP stdio server (terse descriptions, compact JSON — on purpose). `overview.go`/`search.go`: the token-aware reads. `import.go`: GitHub issue import via the `gh` CLI (the only forge-touching code; optional at runtime). `watch.go` has the poll loop shared by `watch` and MCP `wait_for_message`. |
 | `internal/gitcmd/` | The only place git is invoked. Swappable transport. |
 | `internal/store/` | Read/write metadata commits to refs; push/fetch with force-with-lease. `channels.go`: message streams (one commit per message) + shared label/channel definitions. `search.go`: per-worktree read cursors (`<git-dir>/track/cursors/`), cross-channel search, label usage incl. commit trailers. No CLI or output concerns. |
 | `internal/schema/` | Versioned document, validation, dot paths, unknown-field passthrough. |

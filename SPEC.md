@@ -274,6 +274,36 @@ fast-forwardable, and a configured non-forced refspec would make plain
 force-updates defs, and reports channels holding unsent local messages
 instead of clobbering them).
 
+## Import from GitHub
+
+`git track import [issue] [--from github]` (MCP `import_issue`) copies one
+GitHub issue into the current branch's document. It is one-way and
+idempotent: re-running refreshes the mapped fields and touches nothing
+else. All GitHub access goes through the `gh` CLI (`gh issue view --json`,
+`gh pr view --json closingIssuesReferences`); git-track itself holds no
+token and speaks no HTTP, and only this command requires `gh`.
+
+Issue resolution order: explicit number → the document's `issue` field → the
+first number token in the branch name (`42-x`, `feat/42-x`, `issue-42`) → the
+first issue the branch's open pull request closes. None found: exit 2.
+
+| GitHub field | Document field |
+|---|---|
+| `number` | `issue` |
+| `title` | `title` |
+| `body` (trimmed; empty leaves the field alone) | `context` |
+| `labels[].name` | `labels` (replaced; none → field removed) |
+| `url` | appended to `links` if absent |
+| `state == CLOSED` | `state: done` (if `done` is an allowed state) |
+| `state == OPEN` | `state: todo` only when `state` is unset |
+
+`labels[].description`, when non-empty, becomes a shared label definition
+for labels that have none yet (see "Channels and labels"). The write uses
+the normal path: lock enforced (`--force` overrides), validation, CAS, exit
+codes as everywhere. `--from` accepts only `github`; other sources fit the
+same flag later, and today are one shell pipeline into
+`git track set --from-json -`.
+
 ## MCP server
 
 `git track mcp` speaks the Model Context Protocol over stdio (JSON-RPC 2.0,
@@ -283,7 +313,8 @@ client as command `git-track`, args `["mcp"]`, run from inside the repository.
 Tools: `get_overview`, `get_branch_context`, `get_context_markdown`,
 `list_branches`, `set_field`, `unset_field`, `acquire_lock`, `release_lock`,
 `say`, `read_chat` (`unread` flag), `wait_for_message`, `search`,
-`list_channels`, `list_labels`, `define_label`, `define_channel`.
+`import_issue`, `list_channels`, `list_labels`, `define_label`,
+`define_channel`.
 Branch-scoped tools accept an optional `branch` argument, defaulting to the
 checked-out branch. Results are compact JSON; errors come back as tool
 results with `isError: true` and include the CLI exit code. Tool

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1147,5 +1148,135 @@ func TestBinaryAnswersToBothNames(t *testing.T) {
 	}
 	if out, _, code := runIn(t, a, link, "overview", "--json"); code != 0 || !strings.Contains(out, `"channels"`) {
 		t.Fatalf("track overview: %d %s", code, out)
+	}
+}
+
+// --- Import from GitHub (through a fake gh on PATH; the suite stays offline) ---
+
+// fakeGH installs a `gh` script that answers `issue view N` and `pr view`
+// with fixtures and returns the directory to prepend to PATH.
+func fakeGH(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake gh script needs a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := `#!/bin/sh
+case "$1 $2" in
+  "issue view")
+    case "$3" in
+      42) cat <<'JSON'
+{"number":42,"title":"Refactor auth middleware","body":"Tokens are validated in three places.\n\nUnify them.","state":"OPEN","url":"https://github.com/o/r/issues/42","labels":[{"name":"bug","description":"Something is broken"},{"name":"auth","description":""}]}
+JSON
+      ;;
+      7) cat <<'JSON'
+{"number":7,"title":"Old thing","body":"","state":"CLOSED","url":"https://github.com/o/r/issues/7","labels":[]}
+JSON
+      ;;
+      *) echo "GraphQL: Could not resolve to an Issue" >&2; exit 1;;
+    esac;;
+  "pr view") echo '{"closingIssuesReferences":[{"number":42}]}';;
+  *) echo "unexpected: $*" >&2; exit 1;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func trackWithPath(t *testing.T, dir, pathPrefix string, args ...string) (string, string, int) {
+	t.Helper()
+	return trackWithEnvPath(t, dir, pathPrefix+string(os.PathListSeparator)+os.Getenv("PATH"), args...)
+}
+
+// trackWithEnvPath runs the binary with PATH replaced entirely.
+func trackWithEnvPath(t *testing.T, dir, path string, args ...string) (string, string, int) {
+	t.Helper()
+	cmd := exec.Command(binPath, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "PATH="+path)
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	return stdout.String(), stderr.String(), code
+}
+
+func TestImportGitHubIssue(t *testing.T) {
+	_, a := setup(t)
+	ghDir := fakeGH(t)
+	mustTrack(t, a, "set", "next", `["keep me"]`)
+
+	out, stderr, code := trackWithPath(t, a, ghDir, "import", "42", "--json")
+	if code != 0 {
+		t.Fatalf("import failed (%d): %s", code, stderr)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("import --json invalid: %v\n%s", err, out)
+	}
+	if doc["issue"] != 42.0 || doc["title"] != "Refactor auth middleware" || doc["state"] != "todo" {
+		t.Fatalf("mapped fields: %v", doc)
+	}
+	if !strings.Contains(doc["context"].(string), "Unify them.") {
+		t.Fatalf("body not imported as context: %v", doc["context"])
+	}
+	if labels := fmt.Sprint(doc["labels"]); labels != "[bug auth]" {
+		t.Fatalf("labels = %s", labels)
+	}
+	if links := fmt.Sprint(doc["links"]); !strings.Contains(links, "issues/42") {
+		t.Fatalf("links = %s", links)
+	}
+	if next := fmt.Sprint(doc["next"]); next != "[keep me]" {
+		t.Fatalf("unrelated field clobbered: %s", next)
+	}
+	// GitHub label descriptions became definitions; empty ones did not.
+	out = mustTrack(t, a, "labels", "--json")
+	if !strings.Contains(out, `"Something is broken"`) || strings.Contains(out, `"name": "auth",\n      "description": "x"`) {
+		t.Fatalf("label definitions: %s", out)
+	}
+
+	// Re-import refreshes; links are not duplicated.
+	if _, stderr, code := trackWithPath(t, a, ghDir, "import"); code != 0 { // number now comes from the issue field
+		t.Fatalf("re-import: %s", stderr)
+	}
+	if out := mustTrack(t, a, "get", "links"); strings.Count(out, "issues/42") != 1 {
+		t.Fatalf("links duplicated: %s", out)
+	}
+
+	// Closed issue → done; number inferred from the branch name.
+	git(t, a, "checkout", "-b", "7-old-thing")
+	if _, stderr, code := trackWithPath(t, a, ghDir, "import"); code != 0 {
+		t.Fatalf("import on branch 7-old-thing: %s", stderr)
+	}
+	if out := mustTrack(t, a, "get", "state"); strings.TrimSpace(out) != "done" {
+		t.Fatalf("closed issue state = %q", out)
+	}
+	// Number inferred from the PR the branch closes.
+	git(t, a, "checkout", "-b", "no-number-here")
+	if _, stderr, code := trackWithPath(t, a, ghDir, "import"); code != 0 {
+		t.Fatalf("import via PR: %s", stderr)
+	}
+	if out := mustTrack(t, a, "get", "issue"); strings.TrimSpace(out) != "42" {
+		t.Fatalf("issue via PR = %q", out)
+	}
+	// Unknown issue: gh's error surfaces, exit 1.
+	if _, stderr, code := trackWithPath(t, a, ghDir, "import", "999"); code != 1 || !strings.Contains(stderr, "Could not resolve") {
+		t.Fatalf("unknown issue: %d %s", code, stderr)
+	}
+	// Missing gh: clear message, nothing else affected. PATH holds only git.
+	gitPath, _ := exec.LookPath("git")
+	onlyGit := t.TempDir()
+	if err := os.Symlink(gitPath, filepath.Join(onlyGit, "git")); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, code := trackWithEnvPath(t, a, onlyGit, "import", "42"); code != 1 || !strings.Contains(stderr, "GitHub CLI") {
+		t.Fatalf("missing gh: %d %s", code, stderr)
 	}
 }

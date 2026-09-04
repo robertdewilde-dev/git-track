@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/robertdewilde-dev/git-track/internal/schema"
@@ -184,6 +185,9 @@ func mcpTools() []map[string]any {
 				"label": str("Only items carrying this label"),
 				"limit": num("Max messages/commits (default 50)"),
 			}),
+		tool("import_issue",
+			"Pull a GitHub issue (number, title, body, labels, state, url) into the branch's metadata via the gh CLI. Omit issue to infer it from the branch's issue field, branch name, or its PR.",
+			map[string]any{"branch": branch, "issue": num("Issue number")}),
 		tool("list_channels",
 			"Channels with descriptions: main, branches/<branch>, and named topics.",
 			map[string]any{}),
@@ -390,6 +394,20 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 			return fail(err)
 		}
 		return compact(res), false
+	case "import_issue":
+		arg := ""
+		if n := num("issue", 0); n > 0 {
+			arg = strconv.Itoa(n)
+		}
+		number, err := resolveIssue(c, branch, arg)
+		if err != nil {
+			return fail(err)
+		}
+		doc, _, err := importGitHub(c, branch, number, false)
+		if err != nil {
+			return fail(err)
+		}
+		return compact(doc), false
 	case "list_channels":
 		ov, err := buildOverview(c)
 		if err != nil {

@@ -64,6 +64,7 @@ git track set <key> <value>        Set a field (dot paths: agent.lockedBy)
 git track set --from-json <file|-> Replace whole document (validated)
 git track get [key]                Read one field or whole doc
 git track unset <key>              Remove a field
+git track import [issue]           Pull a GitHub issue into this branch (needs gh)
 git track show [branch]            Human-readable summary
 git track overview                 One-screen digest: branches, channels + unread, labels
 git track list                     Table of all branches with metadata
@@ -109,9 +110,35 @@ Global flags: `--json`, `--branch <name>`, `--quiet`, `--no-color`.
   Tools: `get_overview`, `get_branch_context`, `get_context_markdown`,
   `list_branches`, `set_field`, `unset_field`, `acquire_lock`,
   `release_lock`, `say`, `read_chat`, `wait_for_message`, `search`,
-  `list_channels`, `list_labels`, `define_label`, `define_channel`.
-  Results are compact JSON and descriptions are terse: every word costs
+  `import_issue`, `list_channels`, `list_labels`, `define_label`,
+  `define_channel`. Results are compact JSON and descriptions are terse: every word costs
   tokens on every session.
+
+## Import from GitHub
+
+One-way, per branch, a refresh on re-run. It goes through the GitHub CLI
+(`gh`), so nothing else in git-track needs a token or a forge:
+
+```sh
+git checkout -b 42-refactor-auth
+git track import                      # number from the branch name (or pass it: import 42)
+git track show
+```
+
+| GitHub | git-track |
+|---|---|
+| number | `issue` |
+| title | `title` |
+| body | `context` |
+| labels | `labels` (label descriptions become shared definitions) |
+| url | `links` |
+| CLOSED | `state: done` (OPEN sets `todo` only when state is unset) |
+
+Without a number it uses the branch's `issue` field, then a number in the
+branch name, then the issue the branch's open PR closes. Fields GitHub
+doesn't know about (`next`, `agent.*`, custom ones) are left alone. No
+write-back, no bulk import: other sources are a one-liner away through
+`git track set --from-json -`.
 
 ## Channels: `say`, `chat`, `watch`
 
