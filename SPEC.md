@@ -169,9 +169,10 @@ refs/meta/channels/<name>
 ```
 
 (the prefix follows `track.namespace`: its parent plus `/channels`). **One
-commit per message**: the commit message is the message. `git log
-refs/meta/channels/android` literally is the chat log. Message commits have an
-empty tree and are formatted as a body, a blank line, then git trailers:
+commit per event**: the commit message is the event. A chat message is the
+event type `chat`, so `git log refs/meta/channels/android` literally is the
+log. Event commits have an empty tree and are formatted as a body, a blank
+line, then git trailers:
 
 ```
 Emulator is flaky on API 35; pinning to API 34 for now.
@@ -181,8 +182,75 @@ Label: android
 By: robert@robert-desktop
 ```
 
-`Label:` may repeat; `By:` identifies the actor (the git author is a
-fallback). Channel names are ref-relative paths in one namespace:
+```
+3 failures on main
+
+Type: tests.failed
+Subject: feat/x
+Label: ci
+Data: {"count":3}
+By: ci@runner-7
+```
+
+| Trailer | Meaning |
+|---|---|
+| `Type:` | Event type, dotted lowercase. Absent means `chat`, so plain chat commits are unchanged. |
+| `Subject:` | What the event is about (branch, file, issue). Optional. |
+| `Label:` | Classification; may repeat. |
+| `Data:` | JSON payload, compacted to one line. Optional. Invalid JSON is ignored. |
+| `By:` | Producer identity `<user>@<machine>`; the git author is the fallback. |
+
+The trailer paragraph must be the last paragraph and consist only of
+`Key: value` lines. An empty body is stored as the type name.
+
+**CloudEvents.** Every consumer-facing representation (`watch --exec`
+stdin, and by construction any adapter) is a
+[CloudEvents 1.0](https://github.com/cloudevents/spec) JSON envelope:
+
+| CloudEvents attribute | From |
+|---|---|
+| `specversion` | `"1.0"` |
+| `id` | the commit SHA |
+| `source` | `git-track://<By>` |
+| `type` | `Type:` (or `chat`) |
+| `time` | the author date, RFC 3339 |
+| `subject` | `Subject:` |
+| `datacontenttype`, `data` | `application/json`, `Data:` |
+| extensions `channel`, `by`, `body`, `labels` | channel name, `By:`, body text, labels joined with `,` |
+
+### Plain-git events
+
+Any tool can publish an event with two git calls, no binary needed:
+
+```sh
+tip=$(git rev-parse -q --verify refs/meta/channels/main)
+sha=$(git commit-tree $(git mktree </dev/null) ${tip:+-p $tip} \
+      -m "$(printf 'deployed 1.2.3\n\nType: deploy.done\nData: {"env":"prod"}\nBy: ci@runner')")
+git update-ref refs/meta/channels/main $sha ${tip:-0000000000000000000000000000000000000000}
+git push origin refs/meta/channels/main   # or leave it to `git track push --all`
+```
+
+### Triggers
+
+`git track watch [--all|channels] [--type T ...] --exec '<shell command>'`
+runs the command once per matching event, in order, one at a time, with the
+CloudEvents envelope on stdin and `TRACK_CHANNEL`, `TRACK_TYPE`,
+`TRACK_SHA`, `TRACK_BY`, `TRACK_SUBJECT`, `TRACK_LABELS`, `TRACK_BODY`,
+`TRACK_DATA` in the environment. A failing handler is reported on stderr
+and the watch continues. Delivery is at-least-once (a handler that crashes
+mid-way is not retried by git-track; the cursor still advances).
+
+Triggers are **local configuration only** — a flag on the watching machine —
+and never stored in the repository. Anything pushed to a shared ref must
+not be able to choose what executes on someone else's machine. Workflow
+engines with retries, fan-out, or scheduling belong behind `--exec` or
+`watch --json`, not inside git-track.
+
+Limits, structural: latency is the poll interval; throughput is one commit
+and one push per event. Right for agent-speed events (tests failed, review
+requested, deploy done), wrong for logs, metrics, or anything sub-second.
+
+Channel names are ref-relative paths in one namespace:
 
 | Channel | Purpose |
 |---|---|
@@ -312,7 +380,8 @@ client as command `git-track`, args `["mcp"]`, run from inside the repository.
 
 Tools: `get_overview`, `get_branch_context`, `get_context_markdown`,
 `list_branches`, `set_field`, `unset_field`, `acquire_lock`, `release_lock`,
-`say`, `read_chat` (`unread` flag), `wait_for_message`, `search`,
+`say` (`type`, `subject`, `data` for events), `read_chat` (`unread`,
+`type`), `wait_for_message` (`types`), `search`,
 `import_issue`, `list_channels`, `list_labels`, `define_label`,
 `define_channel`.
 Branch-scoped tools accept an optional `branch` argument, defaulting to the

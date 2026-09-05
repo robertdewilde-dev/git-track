@@ -154,14 +154,12 @@ func (s *Store) SearchMessages(text, label string, limit int) ([]ChannelMessage,
 		if len(parts) != 5 {
 			continue
 		}
-		body, by, labels := parseMessage(parts[4], parts[3])
-		if label != "" && !contains(labels, label) {
+		m := parseMessage(parts[4], parts[3])
+		if label != "" && !contains(m.Labels, label) {
 			continue
 		}
-		found = append(found, ChannelMessage{
-			Channel: strings.TrimPrefix(parts[0], ns),
-			Message: Message{SHA: parts[1], At: parts[2], By: by, Labels: labels, Body: body},
-		})
+		m.SHA, m.At = parts[1], parts[2]
+		found = append(found, ChannelMessage{Channel: strings.TrimPrefix(parts[0], ns), Message: m})
 		if limit > 0 && len(found) >= limit {
 			break
 		}

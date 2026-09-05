@@ -71,8 +71,9 @@ git track list                     Table of all branches with metadata
 git track log [branch]             History of metadata changes
 git track lock / unlock            Acquire/release the agent lock
 git track say <msg>                Post to a channel (-c main | -c <name>; default: this branch)
-git track chat [channel]           Read a channel's messages (--unread: only what's new for you)
-git track watch [channel...]       Stream new messages live (--once --timeout to await a reply)
+git track emit <type> [msg]        Post a typed event (--data JSON, --subject) to a channel
+git track chat [channel]           Read a channel (--unread: only what's new; --type to filter)
+git track watch [channel...]       Stream events live (--once --timeout awaits; --type --exec triggers)
 git track search [text] [--label]  Find text/labels across metadata, chat, and commits
 git track channels                 List channels (set/unset define, delete removes)
 git track labels                   Label vocabulary with usage counts (show <name> lists uses)
@@ -183,6 +184,36 @@ counts as seen; `--tail 5` prints recent history first. In MCP the same loop
 is the `wait_for_message` tool: an agent says something, then waits for the
 reply — that's live agent-to-agent conversation with nothing but a git
 remote in between.
+
+### Events and triggers: `emit`, `watch --exec`
+
+Every message is an event; a chat message is the event type `chat`. So the
+same log, sync, `chat`, `watch`, and `search` serve typed events with a JSON
+payload:
+
+```sh
+git track emit tests.failed "3 failures" -c main --data '{"count":3}' --subject feat/x
+git track chat main --type tests.failed
+```
+
+Consumers see every event as a [CloudEvents 1.0](https://cloudevents.io)
+envelope, and `watch --exec` is the trigger: a shell command run per event,
+envelope on stdin, `TRACK_TYPE`/`TRACK_DATA`/`TRACK_CHANNEL`/... in the
+environment. Handlers run one at a time, in order; a failing one is
+reported, not fatal.
+
+```sh
+git track watch --all --type tests.failed --exec 'jq -r .data.count | xargs notify'
+git track watch main --type review.request --exec './scripts/review.sh'
+```
+
+Any tool in any language can publish without the binary — one commit with
+trailers plus one ref update (SPEC.md "Plain-git events") — and CI can post
+results back with `emit` and read them with `chat`. Triggers are local on
+purpose: what runs on a machine is that machine's flag, never something
+pushed to the repository. This is the whole event layer: git is the bus,
+the ref is the stream, cursors are consumer offsets; engines (Actions,
+Temporal, n8n) sit on the other side of `--exec` or `watch --json`.
 
 Merged branches need no cleanup — channels are independent refs; a branch's
 channel stays as history and `git track prune` removes it once the branch is

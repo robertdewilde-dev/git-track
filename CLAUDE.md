@@ -24,6 +24,11 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
   `git track chat main --unread` reads only what is new for you (cursor per
   clone and worktree). Define labels/channels once with
   `git track labels set <name> "<meaning>"` / `channels set`.
+- Events are the same log: `git track emit tests.failed "3 failures" --data
+  '{"count":3}'` posts a typed event (chat is type `chat`); `chat --type X`
+  filters; `watch --type X --exec '<cmd>'` runs a local handler per event
+  with a CloudEvents envelope on stdin. Plain git can publish too (SPEC.md
+  "Plain-git events").
 - Find instead of read: `git track search "<text>"` (metadata + all
   channels) or `git track search --label bug` (also commits carrying a
   `Label: bug` trailer; add one with `git commit --trailer "Label: bug"`).
@@ -41,7 +46,7 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 | Path | What it is |
 |---|---|
 | `main.go` | Entry point; exits with `cmd.Execute()`'s code. |
-| `cmd/` | Cobra subcommands, one file each. `root.go` has exit codes, global flags, the shared `mutateDoc` write path. `mcp.go` is the MCP stdio server (terse descriptions, compact JSON — on purpose). `overview.go`/`search.go`: the token-aware reads. `import.go`: GitHub issue import via the `gh` CLI (the only forge-touching code; optional at runtime). `watch.go` has the poll loop shared by `watch` and MCP `wait_for_message`. |
+| `cmd/` | Cobra subcommands, one file each. `root.go` has exit codes, global flags, the shared `mutateDoc` write path. `mcp.go` is the MCP stdio server (terse descriptions, compact JSON — on purpose). `overview.go`/`search.go`: the token-aware reads. `events.go`: `emit`, the CloudEvents envelope, and the `--exec` handler runner. `import.go`: GitHub issue import via the `gh` CLI (the only forge-touching code; optional at runtime). `watch.go` has the poll loop shared by `watch` and MCP `wait_for_message`. |
 | `internal/gitcmd/` | The only place git is invoked. Swappable transport. |
 | `internal/store/` | Read/write metadata commits to refs; push/fetch with force-with-lease. `channels.go`: message streams (one commit per message) + shared label/channel definitions. `search.go`: per-worktree read cursors (`<git-dir>/track/cursors/`), cross-channel search, label usage incl. commit trailers. No CLI or output concerns. |
 | `internal/schema/` | Versioned document, validation, dot paths, unknown-field passthrough. |
@@ -59,6 +64,8 @@ No working-tree files, no forge dependency; syncs via `git push`/`git fetch`.
 - Startup must stay well under 10ms (runs on every checkout).
 - MCP tool descriptions stay terse and results compact: they are paid for in
   tokens on every agent session.
+- Triggers (`watch --exec`) are local flags, never repository config: nothing
+  pushed to a shared ref may decide what executes on another machine.
 
 ## Development
 

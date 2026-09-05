@@ -1,11 +1,15 @@
 package store
 
-// Channels: async message streams stored as commit chains, one commit per
-// message. The commit message carries the body plus "Label:" / "By:" trailers,
-// so `git log <channel-ref>` is the chat log. Channel and label definitions
-// live in a shared defs document at DefsRef.
+// Channels: append-only event streams stored as commit chains, one commit
+// per event. Chat is just the event type "chat". The commit message carries
+// the human body plus trailers (Type, Label, Subject, Data, By), so
+// `git log <channel-ref>` is the log and any tool can publish with plain
+// git. Channel and label definitions live in a shared defs document at
+// DefsRef.
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -15,13 +19,21 @@ import (
 // DefsFile is the file the defs commit's tree contains.
 const DefsFile = "defs.json"
 
-// Message is one chat message.
+// ChatType is the event type of an ordinary chat message.
+const ChatType = "chat"
+
+// Message is one event in a channel. Type is a CloudEvents-style dotted name
+// ("chat", "tests.failed", "deploy.done"); Data is an optional JSON payload;
+// Subject names what the event is about (a branch, a file, an issue).
 type Message struct {
-	SHA    string   `json:"sha"`
-	At     string   `json:"at"`
-	By     string   `json:"by"`
-	Labels []string `json:"labels,omitempty"`
-	Body   string   `json:"body"`
+	SHA     string          `json:"sha"`
+	At      string          `json:"at"`
+	By      string          `json:"by"`
+	Type    string          `json:"type"`
+	Subject string          `json:"subject,omitempty"`
+	Labels  []string        `json:"labels,omitempty"`
+	Body    string          `json:"body"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }
 
 // metaParent returns the parent path of the branch namespace
@@ -72,23 +84,42 @@ func (s *Store) Channels() ([]string, error) {
 	return names, nil
 }
 
-// renderMessage composes the stored commit message: body, blank line, trailers.
-func renderMessage(body, by string, labels []string) string {
+// renderMessage composes the stored commit message: body, blank line,
+// trailers. A "chat" type is implied and not written, so plain chat commits
+// look exactly as they always did. Data is compacted to one line.
+func renderMessage(m Message) string {
 	var b strings.Builder
-	b.WriteString(strings.TrimRight(body, "\n"))
+	body := strings.TrimRight(m.Body, "\n")
+	if body == "" {
+		body = m.Type
+	}
+	b.WriteString(body)
 	b.WriteString("\n\n")
-	for _, l := range labels {
+	if m.Type != "" && m.Type != ChatType {
+		fmt.Fprintf(&b, "Type: %s\n", m.Type)
+	}
+	if m.Subject != "" {
+		fmt.Fprintf(&b, "Subject: %s\n", m.Subject)
+	}
+	for _, l := range m.Labels {
 		fmt.Fprintf(&b, "Label: %s\n", l)
 	}
-	fmt.Fprintf(&b, "By: %s\n", by)
+	if len(m.Data) > 0 {
+		var buf bytes.Buffer
+		if json.Compact(&buf, m.Data) == nil {
+			fmt.Fprintf(&b, "Data: %s\n", buf.String())
+		}
+	}
+	fmt.Fprintf(&b, "By: %s\n", m.By)
 	return b.String()
 }
 
 // parseMessage splits a raw commit message back into body and trailers.
-// Messages written by other tools may lack trailers; fallbackBy fills in.
-func parseMessage(raw, fallbackBy string) (body, by string, labels []string) {
+// Messages written by other tools may lack trailers; fallbackBy fills in and
+// the type defaults to chat.
+func parseMessage(raw, fallbackBy string) Message {
 	raw = strings.TrimRight(raw, "\n")
-	by = fallbackBy
+	m := Message{By: fallbackBy, Type: ChatType}
 	paras := strings.Split(raw, "\n\n")
 	last := paras[len(paras)-1]
 	trailerish := len(paras) > 1
@@ -99,29 +130,44 @@ func parseMessage(raw, fallbackBy string) (body, by string, labels []string) {
 		}
 	}
 	if !trailerish {
-		return raw, by, nil
+		m.Body = raw
+		return m
 	}
 	for _, line := range strings.Split(last, "\n") {
-		switch {
-		case strings.HasPrefix(line, "Label: "):
-			labels = append(labels, strings.TrimPrefix(line, "Label: "))
-		case strings.HasPrefix(line, "By: "):
-			by = strings.TrimPrefix(line, "By: ")
+		key, val, _ := strings.Cut(line, ": ")
+		switch key {
+		case "Label":
+			m.Labels = append(m.Labels, val)
+		case "By":
+			m.By = val
+		case "Type":
+			m.Type = val
+		case "Subject":
+			m.Subject = val
+		case "Data":
+			if json.Valid([]byte(val)) {
+				m.Data = json.RawMessage(val)
+			}
 		}
 	}
-	return strings.TrimRight(strings.Join(paras[:len(paras)-1], "\n\n"), "\n"), by, labels
+	m.Body = strings.TrimRight(strings.Join(paras[:len(paras)-1], "\n\n"), "\n")
+	return m
 }
 
-// AppendMessage commits one message to a channel locally (compare-and-swap on
-// the channel ref). It does not push; pair with SyncChannel.
-func (s *Store) AppendMessage(channel, body, by string, labels []string) (string, error) {
+// AppendMessage commits one event to a channel locally (compare-and-swap on
+// the channel ref). Only By, Type, Subject, Labels, Body, and Data of m are
+// used. It does not push; pair with SyncChannel.
+func (s *Store) AppendMessage(channel string, m Message) (string, error) {
+	if m.Type == "" {
+		m.Type = ChatType
+	}
 	ref := s.ChannelRef(channel)
 	emptyTree, err := s.Git.RunStdin("", "mktree")
 	if err != nil {
 		return "", err
 	}
 	parent, _ := s.Git.Run("rev-parse", "--verify", "--quiet", ref)
-	args := []string{"commit-tree", emptyTree, "-m", renderMessage(body, by, labels)}
+	args := []string{"commit-tree", emptyTree, "-m", renderMessage(m)}
 	if parent != "" {
 		args = append(args, "-p", parent)
 	}
@@ -207,7 +253,7 @@ func (s *Store) SyncChannel(remote, channel string) error {
 // messageKey identifies a message by content, independent of its commit SHA
 // (a replayed message gets a new SHA but the same key).
 func messageKey(m Message) string {
-	return m.By + "\x00" + m.Body + "\x00" + strings.Join(m.Labels, "\x00")
+	return m.By + "\x00" + m.Type + "\x00" + m.Subject + "\x00" + m.Body + "\x00" + strings.Join(m.Labels, "\x00") + "\x00" + string(m.Data)
 }
 
 // PullChannel brings the local channel up to date with the remote tip
@@ -377,8 +423,9 @@ func (s *Store) logMessages(ref, since string, limit int) ([]Message, error) {
 		if len(parts) != 4 {
 			continue
 		}
-		body, by, labels := parseMessage(parts[3], parts[2])
-		msgs = append(msgs, Message{SHA: parts[0], At: parts[1], By: by, Labels: labels, Body: body})
+		m := parseMessage(parts[3], parts[2])
+		m.SHA, m.At = parts[0], parts[1]
+		msgs = append(msgs, m)
 	}
 	return msgs, nil
 }

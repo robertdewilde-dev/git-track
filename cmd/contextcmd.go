@@ -91,7 +91,11 @@ func contextMarkdown(branch string, doc schema.Doc, msgs []store.Message) string
 			if len(m.Labels) > 0 {
 				labels = " [" + strings.Join(m.Labels, ", ") + "]"
 			}
-			fmt.Fprintf(&b, "  - %s%s: %s\n", m.By, labels, strings.ReplaceAll(m.Body, "\n", " "))
+			typ := ""
+			if m.Type != store.ChatType {
+				typ = " [" + m.Type + "]"
+			}
+			fmt.Fprintf(&b, "  - %s%s%s: %s\n", m.By, typ, labels, strings.ReplaceAll(m.Body, "\n", " "))
 		}
 	}
 	updatedAt, _ := doc["updatedAt"].(string)

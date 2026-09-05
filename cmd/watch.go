@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ type watchOptions struct {
 	interval time.Duration // poll interval
 	timeout  time.Duration // give up after this long (0 = never)
 	once     bool          // stop after the first batch of new messages
+	types    []string      // only emit events of these types (empty = all)
 }
 
 // watchChannels polls the remote (one ls-remote per tick, no object
@@ -86,6 +88,9 @@ func watchChannels(c *appCtx, opts watchOptions, emit func(channel string, m sto
 				msgs = nil // the first tick is the baseline: only what lands after this is new
 			}
 			for i := len(msgs) - 1; i >= 0; i-- {
+				if len(opts.types) > 0 && !slices.Contains(opts.types, msgs[i].Type) {
+					continue
+				}
 				emit(name, msgs[i])
 				batch++
 			}
@@ -127,13 +132,22 @@ channels explicitly, or use --all to watch every channel on the remote
 With --once the command exits after the first batch of new messages (exit 0);
 with --timeout it gives up after that long (exit 2 if nothing arrived). Use
 both to block until someone replies. With --json every message is one JSON
-object per line (JSON Lines), suitable for piping.`,
+object per line (JSON Lines), suitable for piping.
+
+Triggers: --type keeps only events of the given types (repeatable), and
+--exec runs a shell command per event — the CloudEvents envelope on stdin,
+TRACK_CHANNEL/TRACK_TYPE/TRACK_SHA/TRACK_BY/TRACK_SUBJECT/TRACK_LABELS/
+TRACK_BODY/TRACK_DATA in the environment. Handlers run one at a time in
+event order; a failing handler is reported, not fatal. Triggers are local by
+design: nothing pushed to the repository can decide what runs here.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		all, _ := cmd.Flags().GetBool("all")
 		interval, _ := cmd.Flags().GetDuration("interval")
 		timeout, _ := cmd.Flags().GetDuration("timeout")
 		once, _ := cmd.Flags().GetBool("once")
 		tail, _ := cmd.Flags().GetInt("tail")
+		types, _ := cmd.Flags().GetStringArray("type")
+		handler, _ := cmd.Flags().GetString("exec")
 		c, err := newCtx()
 		if err != nil {
 			return jsonError(err)
@@ -151,19 +165,20 @@ object per line (JSON Lines), suitable for piping.`,
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetEscapeHTML(false)
 		emit := func(channel string, m store.Message) {
+			if handler != "" {
+				if err := runHandler(handler, channel, m); err != nil {
+					info("watch: handler failed for %s %s: %s", m.Type, m.SHA[:12], err)
+				}
+			}
 			if flagJSON {
-				_ = enc.Encode(map[string]any{"channel": channel, "sha": m.SHA, "at": m.At, "by": m.By, "labels": m.Labels, "body": m.Body})
+				_ = enc.Encode(store.ChannelMessage{Channel: channel, Message: m})
 				return
 			}
 			ts := m.At
 			if t, err := time.Parse(time.RFC3339, m.At); err == nil {
 				ts = t.Local().Format("15:04:05")
 			}
-			labels := ""
-			if len(m.Labels) > 0 {
-				labels = "  [" + strings.Join(m.Labels, ", ") + "]"
-			}
-			fmt.Printf("%s %s  %s%s\n%s\n\n", bold("#"+channel), dim(ts), bold(m.By), labels, m.Body)
+			fmt.Printf("%s %s\n", bold("#"+channel), formatMessage(m, ts))
 		}
 		if tail > 0 {
 			for _, name := range channels {
@@ -177,7 +192,7 @@ object per line (JSON Lines), suitable for piping.`,
 		if !flagJSON {
 			info("watching %s every %s (ctrl-c to stop)", strings.Join(channelsLabel(channels, all), ", "), interval)
 		}
-		n, err := watchChannels(c, watchOptions{channels: channels, all: all, interval: interval, timeout: timeout, once: once}, emit)
+		n, err := watchChannels(c, watchOptions{channels: channels, all: all, interval: interval, timeout: timeout, once: once, types: types}, emit)
 		if err != nil {
 			return jsonError(err)
 		}
@@ -205,5 +220,7 @@ func init() {
 	watchCmd.Flags().Duration("timeout", 0, "stop after this long (0 = never)")
 	watchCmd.Flags().Bool("once", false, "exit after the first batch of new messages")
 	watchCmd.Flags().Int("tail", 0, "print the last N existing messages first")
+	watchCmd.Flags().StringArray("type", nil, "only events of this type (repeatable)")
+	watchCmd.Flags().String("exec", "", "run this shell command per event (envelope on stdin)")
 	rootCmd.AddCommand(watchCmd)
 }

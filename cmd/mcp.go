@@ -157,12 +157,15 @@ func mcpTools() []map[string]any {
 			"Release the branch's agent lock.",
 			map[string]any{"branch": branch}),
 		tool("say",
-			"Post a message to a channel (findings, decisions, questions, progress) for other agents. Syncs to the remote at once; concurrent posts merge. Then wait_for_message for a reply.",
+			"Post to a channel for other agents: a chat message, or with type a typed event (tests.failed, deploy.done) with optional JSON data. Syncs at once; concurrent posts merge. Then wait_for_message for a reply.",
 			map[string]any{
 				"text":    str("Message body"),
 				"channel": channel,
 				"labels":  strs("Labels like bug, decision, question (see list_labels)"),
-			}, "text"),
+				"type":    str("Event type, dotted lowercase (default chat)"),
+				"subject": str("What the event is about (branch, file, issue)"),
+				"data":    map[string]any{"type": "object", "description": "JSON payload for typed events"},
+			}),
 		tool("read_chat",
 			"Read a channel's messages, newest first, and mark it read. unread=true returns only what arrived since you last read it here.",
 			map[string]any{
@@ -170,12 +173,14 @@ func mcpTools() []map[string]any {
 				"limit":   num("Max messages (default 20)"),
 				"since":   str("Only messages after this sha"),
 				"unread":  boolean("Only messages since the channel was last read here"),
+				"type":    str("Only events of this type"),
 			}),
 		tool("wait_for_message",
 			"Block until a new message lands on the watched channels or the timeout passes; returns the new messages (your own posts excluded). Default: this branch's channel and main.",
 			map[string]any{
 				"channels":        strs("Channels to watch"),
 				"all":             boolean("Watch every channel"),
+				"types":           strs("Only events of these types"),
 				"timeout_seconds": num("Give up after this long (default 60; keep under your tool-call timeout)"),
 			}),
 		tool("search",
@@ -329,21 +334,27 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 		return "unlocked " + branch, false
 	case "say":
 		text := str("text")
-		if text == "" {
+		m := store.Message{Type: str("type"), Subject: str("subject"), Labels: strs("labels"), Body: text}
+		if m.Type == "" {
+			m.Type = store.ChatType
+		}
+		if d, ok := args["data"]; ok && d != nil {
+			m.Data, _ = json.Marshal(d)
+		}
+		if text == "" && m.Type == store.ChatType {
 			return "empty message", true
 		}
-		channel := str("channel")
-		if channel == "" {
-			channel = store.BranchChannel(branch)
-		}
-		sha, err := postMessage(c, channel, text, strs("labels"))
+		channel, sha, synced, err := publish(c, str("channel"), m)
 		if err != nil {
 			return fail(err)
 		}
+		if text == "" {
+			text = m.Type
+		}
 		mcpPosted[channel+"\x00"+text] = true
 		note := ""
-		if err := c.store.SyncChannel(c.remote(), channel); err != nil {
-			note = " (saved locally; remote sync failed: " + err.Error() + ")"
+		if !synced {
+			note = " (saved locally; remote sync failed)"
 		}
 		return "posted to #" + channel + " as " + sha[:12] + note, false
 	case "read_chat":
@@ -355,11 +366,25 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 		if unread, _ := args["unread"].(bool); unread {
 			since, limit = c.store.Cursor(channel), 0
 		}
+		typ := str("type")
+		if typ != "" {
+			limit = 0
+		}
 		msgs, err := c.store.MessagesSince(channel, since, limit)
 		if err != nil {
 			return fail(err)
 		}
-		_ = c.store.MarkRead(channel)
+		if typ != "" {
+			kept := []store.Message{}
+			for _, m := range msgs {
+				if m.Type == typ {
+					kept = append(kept, m)
+				}
+			}
+			msgs = kept
+		} else {
+			_ = c.store.MarkRead(channel)
+		}
 		if msgs == nil {
 			msgs = []store.Message{}
 		}
@@ -371,6 +396,7 @@ func callMCPTool(c *appCtx, name string, args map[string]any) (string, bool) {
 		}
 		opts.all, _ = args["all"].(bool)
 		opts.channels = strs("channels")
+		opts.types = strs("types")
 		if len(opts.channels) == 0 && !opts.all {
 			opts.channels = []string{store.MainChannel, store.BranchChannel(branch)}
 		}

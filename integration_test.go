@@ -624,6 +624,14 @@ func TestMCPServer(t *testing.T) {
 		t.Fatalf("unexpected tool result: %s", content)
 	}
 
+	send(`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"say","arguments":{"channel":"main","type":"deploy.done","subject":"prod","data":{"version":"1.2.3"}}}}`)
+	if r := recv(); r["result"].(map[string]any)["isError"] == true {
+		t.Fatalf("typed say via MCP: %v", r)
+	}
+	if out := mustTrack(t, a, "chat", "main", "--type", "deploy.done", "--json"); !strings.Contains(out, `"version": "1.2.3"`) || !strings.Contains(out, `"subject": "prod"`) {
+		t.Fatalf("typed event not stored: %s", out)
+	}
+
 	send(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_overview","arguments":{}}}`)
 	ov := recv()["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
 	if !strings.Contains(ov, `"branches":[{"branch":"main","state":"in-progress"`) || !strings.Contains(ov, `"name":"main"`) {
@@ -1278,5 +1286,74 @@ func TestImportGitHubIssue(t *testing.T) {
 	}
 	if _, stderr, code := trackWithEnvPath(t, a, onlyGit, "import", "42"); code != 1 || !strings.Contains(stderr, "GitHub CLI") {
 		t.Fatalf("missing gh: %d %s", code, stderr)
+	}
+}
+
+// --- Events: emit, typed reads, triggers ---
+
+func TestEmitEventsAndTriggers(t *testing.T) {
+	remote, a := setup(t)
+	out := mustTrack(t, a, "emit", "tests.failed", "3 failures on main", "-c", "main",
+		"--data", `{"count":3}`, "--subject", "main", "--label", "ci", "--json")
+	if !strings.Contains(out, `"type": "tests.failed"`) {
+		t.Fatalf("emit --json: %s", out)
+	}
+	mustTrack(t, a, "say", "-c", "main", "looking into it")
+
+	// A chat message is the event type "chat"; typed events carry data.
+	out = mustTrack(t, a, "chat", "main", "--json")
+	for _, want := range []string{`"type": "chat"`, `"type": "tests.failed"`, `"count": 3`, `"subject": "main"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("chat --json missing %s:\n%s", want, out)
+		}
+	}
+	out = mustTrack(t, a, "chat", "main", "--type", "tests.failed", "--json")
+	if strings.Contains(out, "looking into it") || !strings.Contains(out, "3 failures") {
+		t.Fatalf("--type filter: %s", out)
+	}
+	// search finds events by their type line, no index needed.
+	if out := mustTrack(t, a, "search", "tests.failed", "--json"); !strings.Contains(out, `"count": 3`) {
+		t.Fatalf("search by type: %s", out)
+	}
+
+	// Plain git can publish an event: commit with trailers, update the ref.
+	tree := git(t, a, "mktree")
+	tip := git(t, a, "rev-parse", "refs/meta/channels/main")
+	sha := git(t, a, "commit-tree", tree, "-p", tip, "-m", "deployed\n\nType: deploy.done\nData: {\"env\":\"prod\"}\nBy: ci@runner")
+	git(t, a, "update-ref", "refs/meta/channels/main", sha, tip)
+	out = mustTrack(t, a, "chat", "main", "--type", "deploy.done", "--json")
+	if !strings.Contains(out, `"env": "prod"`) || !strings.Contains(out, `"by": "ci@runner"`) {
+		t.Fatalf("plain-git event not parsed: %s", out)
+	}
+
+	// Trigger: watch --type ... --exec runs a handler with the CloudEvents
+	// envelope on stdin and TRACK_* in the environment; other types are ignored.
+	b := cloneOf(t, remote, "clone-b")
+	mustTrack(t, b, "fetch")
+	log := filepath.Join(t.TempDir(), "handled.txt")
+	handler := "cat >> " + log + `; printf '%s|%s|%s\n' "$TRACK_TYPE" "$TRACK_SUBJECT" "$TRACK_DATA" >> ` + log
+	wait := startWatch(t, b, "main", "--once", "--timeout", "20s", "--interval", "300ms",
+		"--type", "tests.failed", "--exec", handler, "--json")
+	mustTrack(t, a, "say", "-c", "main", "chatter that must not trigger")
+	mustTrack(t, a, "emit", "tests.failed", "flaky again", "-c", "main", "--data", `{"count":1}`, "--subject", "feat/x")
+	out, code := wait()
+	if code != 0 {
+		t.Fatalf("watch exit %d:\n%s", code, out)
+	}
+	if strings.Contains(out, "chatter") || !strings.Contains(out, `"type":"tests.failed"`) || !strings.Contains(out, `"channel":"main"`) {
+		t.Fatalf("watch output: %s", out)
+	}
+	handled, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatalf("handler never ran: %v", err)
+	}
+	got := string(handled)
+	for _, want := range []string{`"specversion":"1.0"`, `"type":"tests.failed"`, `"source":"git-track://`, `"datacontenttype":"application/json"`, `"data":{"count":1}`, "tests.failed|feat/x|{\"count\":1}"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("handler input missing %s:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "specversion") != 1 {
+		t.Fatalf("handler ran for the wrong events:\n%s", got)
 	}
 }

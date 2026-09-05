@@ -35,13 +35,6 @@ channel. Pass '-' to read the message body from stdin.`,
 		if err != nil {
 			return jsonError(err)
 		}
-		if channel == "" {
-			branch, err := c.branch()
-			if err != nil {
-				return jsonError(err)
-			}
-			channel = store.BranchChannel(branch)
-		}
 		body := args[0]
 		if body == "-" {
 			data, err := io.ReadAll(os.Stdin)
@@ -53,15 +46,9 @@ channel. Pass '-' to read the message body from stdin.`,
 		if strings.TrimSpace(body) == "" {
 			return jsonError(exitErr(ExitError, "empty message"))
 		}
-		hintUndefinedLabels(c, labels)
-		sha, err := postMessage(c, channel, body, labels)
+		channel, sha, synced, err := publish(c, channel, store.Message{Type: store.ChatType, Labels: labels, Body: body})
 		if err != nil {
 			return jsonError(err)
-		}
-		synced := true
-		if err := c.store.SyncChannel(c.remote(), channel); err != nil {
-			synced = false
-			info("message saved locally; sync failed (%s) — it will sync on the next say or `git track push --all`", err)
 		}
 		if flagJSON {
 			return printJSON(map[string]any{"channel": channel, "sha": sha, "synced": synced})
@@ -71,28 +58,45 @@ channel. Pass '-' to read the message body from stdin.`,
 	},
 }
 
-// postMessage appends a message and keeps the read cursor in step: when the
-// poster had read everything before posting, their own message is not
-// "unread" afterwards.
-func postMessage(c *appCtx, channel, body string, labels []string) (string, error) {
+// publish is the one write path for channels, shared by say, emit, and the
+// MCP tool: resolve the channel (empty = this branch's), append the event,
+// keep the read cursor in step (a poster who had read everything is not
+// left with their own event "unread"), and sync to the remote. A failed
+// sync is not an error — the event is safe locally and goes with the next
+// publish or `git track push --all` — so it is reported as synced=false.
+func publish(c *appCtx, channel string, m store.Message) (resolved, sha string, synced bool, err error) {
+	if channel == "" {
+		branch, err := c.branch()
+		if err != nil {
+			return "", "", false, err
+		}
+		channel = store.BranchChannel(branch)
+	}
+	hintUndefinedLabels(c, m.Labels)
 	prev := c.store.ChannelTip(channel)
-	sha, err := c.store.AppendMessage(channel, body, lock.Actor(), labels)
+	m.By = lock.Actor()
+	sha, err = c.store.AppendMessage(channel, m)
 	if err != nil {
-		return "", err
+		return "", "", false, err
 	}
 	if c.store.Cursor(channel) == prev {
 		_ = c.store.SetCursor(channel, sha)
 	}
-	return sha, nil
+	if err := c.store.SyncChannel(c.remote(), channel); err != nil {
+		info("#%s: saved locally; sync failed (%s) — it goes with the next post or `git track push --all`", channel, err)
+		return channel, sha, false, nil
+	}
+	return channel, sha, true, nil
 }
 
 var chatCmd = &cobra.Command{
 	Use:   "chat [channel]",
 	Short: "Read a channel's messages (default: this branch's channel)",
-	Long: `Read the messages in a channel, oldest first. Messages arrive with
-'git track fetch'; to react to new messages as they arrive use
-'git track watch'. Filter with --label; --limit bounds how many recent
-messages are shown; --since <sha> shows only messages after that one.
+	Long: `Read a channel, oldest first: chat messages and typed events alike (events
+show a [type] marker and their data). Messages arrive with 'git track fetch';
+to react to new ones as they arrive use 'git track watch'. Filter with
+--label or --type; --limit bounds how many recent messages are shown;
+--since <sha> shows only messages after that one.
 
 --unread shows only what landed since this channel was last read here, then
 marks it read. Every unfiltered read marks the channel read; the cursor is
@@ -105,6 +109,7 @@ coordination channel, or any named channel.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		limit, _ := cmd.Flags().GetInt("limit")
 		labelFilter, _ := cmd.Flags().GetString("label")
+		typeFilter, _ := cmd.Flags().GetString("type")
 		since, _ := cmd.Flags().GetString("since")
 		unread, _ := cmd.Flags().GetBool("unread")
 		c, err := newCtx()
@@ -127,7 +132,7 @@ coordination channel, or any named channel.`,
 		}
 		// Over-fetch when filtering so --limit counts matching messages.
 		fetchLimit := limit
-		if labelFilter != "" {
+		if labelFilter != "" || typeFilter != "" {
 			fetchLimit = 0
 		}
 		msgs, err := c.store.MessagesSince(channel, since, fetchLimit)
@@ -137,12 +142,13 @@ coordination channel, or any named channel.`,
 			}
 			return jsonError(err)
 		}
-		if labelFilter == "" {
+		if labelFilter == "" && typeFilter == "" {
 			_ = c.store.MarkRead(channel)
 		}
-		if labelFilter != "" {
+		if labelFilter != "" || typeFilter != "" {
 			msgs = slices.DeleteFunc(msgs, func(m store.Message) bool {
-				return !slices.Contains(m.Labels, labelFilter)
+				return (labelFilter != "" && !slices.Contains(m.Labels, labelFilter)) ||
+					(typeFilter != "" && m.Type != typeFilter)
 			})
 			if limit > 0 && len(msgs) > limit {
 				msgs = msgs[:limit]
@@ -165,11 +171,7 @@ coordination channel, or any named channel.`,
 			if t, err := time.Parse(time.RFC3339, m.At); err == nil {
 				ts = t.Local().Format("2006-01-02 15:04")
 			}
-			labels := ""
-			if len(m.Labels) > 0 {
-				labels = "  [" + strings.Join(m.Labels, ", ") + "]"
-			}
-			fmt.Printf("\n%s  %s%s\n%s\n", dim(ts), bold(m.By), labels, m.Body)
+			fmt.Printf("\n%s", formatMessage(m, ts))
 		}
 		return nil
 	},
@@ -180,6 +182,7 @@ func init() {
 	sayCmd.Flags().StringArray("label", nil, "label the message (repeatable)")
 	chatCmd.Flags().IntP("limit", "n", 30, "show at most this many recent messages (0 = all)")
 	chatCmd.Flags().String("label", "", "only show messages carrying this label")
+	chatCmd.Flags().String("type", "", "only show events of this type (chat is a type too)")
 	chatCmd.Flags().String("since", "", "only show messages after this message sha")
 	chatCmd.Flags().Bool("unread", false, "only messages since this channel was last read here")
 	rootCmd.AddCommand(sayCmd, chatCmd)
